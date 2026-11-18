@@ -9,6 +9,7 @@ mod claude_ui;
 mod editor;
 mod git;
 mod highlight;
+mod plan;
 mod search;
 mod settings;
 mod theme;

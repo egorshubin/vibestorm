@@ -1,10 +1,11 @@
 //! Main application: multi-project workspace in a single window.
 
-use crate::claude::{Chat, MODELS, MODES, RateLimit, Signal};
+use crate::claude::{Chat, MODELS, MODES, Signal};
 use crate::claude_ui::{self, ChatAction};
 use crate::editor::{self, Doc, EditorCtx};
 use crate::git::{GitFile, GitState, GitUiAction};
 use crate::highlight::Highlighting;
+use crate::plan::{self, PlanUsage};
 use crate::search::{self, FileIndex, FindInFiles};
 use crate::settings::{ProjectMemo, Settings};
 use crate::theme::{self, Palette};
@@ -29,12 +30,14 @@ pub struct Project {
     pub name: String,
     tree: FileTree,
     docs: Vec<Doc>,
-    /// `None` = the pinned Claude Code tab
+    /// `None` = the Claude Code tab `active_chat`
     active_doc: Option<usize>,
     /// last real file viewed, offered as an @-mention in the Claude tab
     last_file: Option<PathBuf>,
     git: GitState,
-    chat: Chat,
+    /// one tab per conversation, shown before the files; never empty
+    chats: Vec<Chat>,
+    active_chat: usize,
     index: FileIndex,
     find: FindInFiles,
     attention: Attention,
@@ -61,7 +64,8 @@ impl Project {
             active_doc: None,
             last_file: None,
             git: GitState::new(root.clone(), ctx.clone()),
-            chat: Chat::new(root.clone(), ctx.clone(), s.claude_model.clone(), s.claude_mode.clone(), None),
+            chats: vec![Chat::new(root.clone(), ctx.clone(), s.claude_model.clone(), s.claude_mode.clone(), None)],
+            active_chat: 0,
             index: FileIndex::build(root.clone(), ctx.clone()),
             find: FindInFiles::default(),
             attention: Attention::None,
@@ -95,7 +99,7 @@ impl Project {
                 .and_then(|i| self.docs.get(i))
                 .filter(|d| !d.is_virtual())
                 .map(|d| d.path.to_string_lossy().into_owned()),
-            last_session: self.chat.session_id.clone().or(self.last_session.clone()),
+            last_session: self.chat().session_id.clone().or(self.last_session.clone()),
             last_active: self.last_active,
         }
     }
@@ -108,6 +112,89 @@ impl Project {
 
     fn dirty_count(&self) -> usize {
         self.docs.iter().filter(|d| d.dirty).count()
+    }
+
+    fn chat(&self) -> &Chat {
+        &self.chats[self.active_chat]
+    }
+
+    fn chat_mut(&mut self) -> &mut Chat {
+        &mut self.chats[self.active_chat]
+    }
+
+    fn busy(&self) -> bool {
+        self.chats.iter().any(|c| c.busy)
+    }
+
+    fn pending_approvals(&self) -> usize {
+        self.chats.iter().map(|c| c.pending_approvals()).sum()
+    }
+
+    /// The conversation that needs the user most: approval > working > unread reply > current.
+    fn status_chat(&self) -> &Chat {
+        self.chats
+            .iter()
+            .find(|c| c.pending_approvals() > 0)
+            .or_else(|| self.chats.iter().find(|c| c.busy))
+            .unwrap_or(self.chat())
+    }
+
+    fn show_chat(&mut self, i: usize) {
+        self.active_chat = i.min(self.chats.len() - 1);
+        self.active_doc = None;
+        let c = self.chat_mut();
+        c.unseen = false;
+        c.focus_input = true;
+    }
+
+    /// An untouched conversation tab, or a new one.
+    fn blank_chat(&mut self) -> usize {
+        if let Some(i) = self.chats.iter().position(|c| c.is_blank()) {
+            return i;
+        }
+        let c = self.chats[0].sibling();
+        self.chats.push(c);
+        self.chats.len() - 1
+    }
+
+    fn new_session(&mut self) {
+        let i = self.blank_chat();
+        self.show_chat(i);
+    }
+
+    /// Show a stored conversation: its tab if already open, else a new tab.
+    fn open_session(&mut self, id: &str) {
+        let i = match self.chats.iter().position(|c| c.holds_session(id)) {
+            Some(i) => i,
+            None => {
+                let i = self.blank_chat();
+                self.chats[i].open_session(id);
+                i
+            }
+        };
+        self.show_chat(i);
+    }
+
+    /// Close a conversation tab (stops its process). The last one is replaced by a new session.
+    fn close_chat(&mut self, i: usize) {
+        if i >= self.chats.len() {
+            return;
+        }
+        let viewing = self.active_doc.is_none() && self.active_chat == i;
+        if self.chats.len() == 1 {
+            let c = self.chats[0].sibling();
+            self.chats.push(c);
+        }
+        if let Some(id) = self.chats[i].session_id.clone() {
+            self.last_session = Some(id);
+        }
+        self.chats.remove(i);
+        if self.active_chat > i || self.active_chat >= self.chats.len() {
+            self.active_chat -= 1;
+        }
+        if viewing {
+            self.show_chat(self.active_chat);
+        }
     }
 }
 
@@ -138,6 +225,8 @@ enum Confirm {
     Delete(PathBuf),
     Rollback(Vec<GitFile>),
     CloseTab(usize),
+    /// a conversation tab whose agent is still working
+    CloseChat(usize),
     CloseProject(usize),
     Exit,
 }
@@ -167,6 +256,11 @@ enum Action {
     CloseProject(usize),
     CloseTab(usize),
     CloseOthers(usize),
+    /// Claude Code conversation tabs of the active project
+    ShowChat(usize),
+    CloseChat(usize),
+    NewSession,
+    OpenSession(String),
     Prompt(PromptKind),
     Confirm(Confirm),
     Terminal(PathBuf),
@@ -196,6 +290,8 @@ pub struct IdeApp {
     /// project roots whose Windows toast was clicked
     toast_click_tx: std::sync::mpsc::Sender<PathBuf>,
     toast_click_rx: std::sync::mpsc::Receiver<PathBuf>,
+    /// account-wide plan limits from Anthropic (all clients, not just our agents)
+    plan: PlanUsage,
 }
 
 struct InAppToast {
@@ -250,6 +346,7 @@ impl IdeApp {
             toasts: vec![],
             toast_click_tx,
             toast_click_rx,
+            plan: PlanUsage::new(),
             hl,
             projects: vec![],
             active: 0,
@@ -326,9 +423,7 @@ impl IdeApp {
             self.active = i;
             let p = &mut self.projects[i];
             p.attention = Attention::None;
-            p.chat.unseen = false;
-            p.chat.focus_input = true;
-            p.active_doc = None; // Claude Code is the default view of a project
+            p.show_chat(p.active_chat); // Claude Code is the default view of a project
             p.check_disk(&self.hl);
             p.git.refresh_status();
             self.persist();
@@ -358,9 +453,18 @@ impl IdeApp {
 
     fn show_claude(&mut self) {
         if let Some(p) = self.proj() {
-            p.active_doc = None;
-            p.chat.focus_input = true;
+            p.show_chat(p.active_chat);
         }
+    }
+
+    fn close_chat(&mut self, i: usize, force: bool) {
+        let Some(p) = self.projects.get_mut(self.active) else { return };
+        if !force && p.chats.get(i).is_some_and(|c| c.busy) {
+            self.confirm = Some(Confirm::CloseChat(i));
+            return;
+        }
+        p.close_chat(i);
+        self.persist();
     }
 
     fn proj(&mut self) -> Option<&mut Project> {
@@ -425,7 +529,7 @@ impl IdeApp {
         if i >= self.projects.len() {
             return;
         }
-        if !force && (self.projects[i].dirty_count() > 0 || self.projects[i].chat.busy) {
+        if !force && (self.projects[i].dirty_count() > 0 || self.projects[i].busy()) {
             self.confirm = Some(Confirm::CloseProject(i));
             return;
         }
@@ -604,18 +708,21 @@ impl IdeApp {
             self.prompt = Some(Prompt { kind: PromptKind::GotoLine, value: String::new(), focus: true });
         }
         if sc(Modifiers::COMMAND, Key::W) || sc(Modifiers::COMMAND, Key::F4) {
-            if let Some(i) = self.proj().and_then(|p| p.active_doc) {
-                self.close_tab(i, false);
+            match self.proj().map(|p| (p.active_doc, p.active_chat)) {
+                Some((Some(i), _)) => self.close_tab(i, false),
+                Some((None, c)) => self.close_chat(c, false),
+                None => {}
             }
         }
         if sc(Modifiers::COMMAND, Key::Tab) {
             if let Some(p) = self.proj() {
-                // the Claude tab (None) sits before the first file
-                p.active_doc = match p.active_doc {
-                    None if !p.docs.is_empty() => Some(0),
-                    Some(a) if a + 1 < p.docs.len() => Some(a + 1),
-                    _ => None,
-                };
+                // the Claude tabs sit before the first file
+                match p.active_doc {
+                    None if p.active_chat + 1 < p.chats.len() => p.show_chat(p.active_chat + 1),
+                    None if !p.docs.is_empty() => p.active_doc = Some(0),
+                    Some(a) if a + 1 < p.docs.len() => p.active_doc = Some(a + 1),
+                    _ => p.show_chat(0),
+                }
             }
         }
         if sc(Modifiers::COMMAND, Key::K) {
@@ -708,13 +815,13 @@ impl IdeApp {
 
         egui::ScrollArea::vertical().id_salt("projects_sb").auto_shrink([false, false]).show(ui, |ui| {
             for (i, p) in self.projects.iter().enumerate() {
-                let approvals = p.chat.pending_approvals();
+                let approvals = p.pending_approvals();
                 let pulse = 0.72 + 0.28 * ((now * 3.0).sin() as f32 * 0.5 + 0.5);
                 // folder colour = agent state
                 let (status, scol, fcol): (String, Color32, Color32) = if approvals > 0 {
                     (format!("⚠ needs approval ({approvals})"), FOLDER_ALERT, FOLDER_ALERT)
-                } else if p.chat.busy {
-                    let secs = p.chat.busy_since.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+                } else if p.busy() {
+                    let secs = p.chats.iter().filter_map(|c| c.busy_since).map(|t| t.elapsed().as_secs()).max().unwrap_or(0);
                     (format!("agent working {}", util::fmt_duration(secs)), FOLDER_WORKING, FOLDER_WORKING.gamma_multiply(pulse))
                 } else if p.attention == Attention::Done {
                     ("✔ agent finished".into(), FOLDER_DONE, FOLDER_DONE)
@@ -894,23 +1001,6 @@ impl IdeApp {
                 if ui.button(">_").on_hover_text("Open terminal in project").clicked() {
                     acts.push(Action::Terminal(p.root.clone()));
                 }
-                ui.separator();
-                if p.git.status.is_repo {
-                    let push_lbl = if p.git.status.ahead > 0 { format!("⬆ Push ({})", p.git.status.ahead) } else { "⬆ Push".into() };
-                    if ui.button(push_lbl).on_hover_text("Push (Ctrl+Shift+K)").clicked() {
-                        p.git.push();
-                    }
-                    if ui.button("✔ Commit").on_hover_text("Commit (Ctrl+K)").clicked() {
-                        self.left = Some(LeftTab::Commit);
-                    }
-                    let pull_lbl = if p.git.status.behind > 0 { format!("⬇ Pull ({})", p.git.status.behind) } else { "⬇ Pull".into() };
-                    if ui.button(pull_lbl).on_hover_text("Update project (Ctrl+T)").clicked() {
-                        p.git.pull();
-                    }
-                    if ui.button("⟳").on_hover_text("Fetch").clicked() {
-                        p.git.fetch();
-                    }
-                }
             });
         });
     }
@@ -960,7 +1050,7 @@ impl IdeApp {
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.add_space(8.0);
-                let c = &p.chat;
+                let c = p.status_chat();
                 let (ct, cc) = if c.pending_approvals() > 0 {
                     ("Claude: needs approval".to_owned(), pal.warn)
                 } else if c.busy {
@@ -968,9 +1058,10 @@ impl IdeApp {
                 } else {
                     ("Claude: idle".to_owned(), pal.text_weak)
                 };
+                let c = c.uid;
                 if ui.add(egui::Label::new(RichText::new(ct).small().color(cc)).sense(Sense::click())).clicked() {
-                    p.active_doc = None;
-                    p.chat.focus_input = true;
+                    let i = p.chats.iter().position(|x| x.uid == c).unwrap_or(p.active_chat);
+                    p.show_chat(i);
                 }
                 if p.git.status.is_repo {
                     let s = &p.git.status;
@@ -1005,10 +1096,9 @@ impl IdeApp {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
-                    // pinned Claude Code tab: always first, can't be closed
-                    {
-                        let active = p.active_doc.is_none();
-                        let c = &p.chat;
+                    // Claude Code tabs, one per conversation, before the files
+                    for (i, c) in p.chats.iter().enumerate() {
+                        let active = p.active_doc.is_none() && p.active_chat == i;
                         let (mark, mcol) = if c.pending_approvals() > 0 {
                             ("⚠", pal.warn)
                         } else if c.busy {
@@ -1018,10 +1108,11 @@ impl IdeApp {
                         } else {
                             ("", pal.text_weak)
                         };
+                        let title = c.title();
+                        let label = title.as_deref().map(|t| util::truncate(t, 28)).unwrap_or_else(|| "New session".into());
                         let font = FontId::proportional(13.0);
-                        let label = "Claude Code";
-                        let tw = ui.fonts_mut(|f| f.layout_no_wrap(label.into(), font.clone(), pal.text).size().x);
-                        let w = tw + if mark.is_empty() { 44.0 } else { 62.0 };
+                        let tw = ui.fonts_mut(|f| f.layout_no_wrap(label.clone(), font.clone(), pal.text).size().x);
+                        let w = tw + if mark.is_empty() { 62.0 } else { 80.0 };
                         let (rect, resp) = ui.allocate_exact_size(vec2(w, 32.0), Sense::click());
                         let painter = ui.painter();
                         if active {
@@ -1031,15 +1122,40 @@ impl IdeApp {
                             painter.rect_filled(rect, 0.0, pal.hover);
                         }
                         painter.text(pos2(rect.min.x + 18.0, rect.center().y), Align2::CENTER_CENTER, "✻", FontId::proportional(15.0), claude_ui::CLAUDE);
-                        painter.text(pos2(rect.min.x + 32.0, rect.center().y), Align2::LEFT_CENTER, label, font, pal.text);
+                        painter.text(pos2(rect.min.x + 32.0, rect.center().y), Align2::LEFT_CENTER, &label, font, pal.text);
                         if !mark.is_empty() {
-                            painter.text(pos2(rect.max.x - 14.0, rect.center().y), Align2::CENTER_CENTER, mark, FontId::proportional(12.0), mcol);
+                            painter.text(pos2(rect.max.x - 32.0, rect.center().y), Align2::CENTER_CENTER, mark, FontId::proportional(12.0), mcol);
+                        }
+                        let close_r = egui::Rect::from_center_size(pos2(rect.max.x - 14.0, rect.center().y), vec2(16.0, 16.0));
+                        let close_hover = ui.rect_contains_pointer(close_r);
+                        if resp.hovered() || active {
+                            if close_hover {
+                                painter.rect_filled(close_r, 3.0, pal.hover);
+                            }
+                            painter.text(close_r.center(), Align2::CENTER_CENTER, "×", FontId::proportional(14.0), pal.text_weak);
                         }
                         painter.line_segment([rect.right_top(), rect.right_bottom()], Stroke::new(1.0, pal.border.gamma_multiply(0.5)));
-                        if resp.on_hover_text("Claude Code (Alt+2)").clicked() {
-                            p.active_doc = None;
-                            p.chat.focus_input = true;
+                        let resp = resp.on_hover_text(format!("{} (Alt+2)", title.as_deref().unwrap_or("New Claude Code session")));
+                        if resp.clicked() {
+                            if close_hover {
+                                acts.push(Action::CloseChat(i));
+                            } else {
+                                acts.push(Action::ShowChat(i));
+                            }
                         }
+                        if resp.middle_clicked() {
+                            acts.push(Action::CloseChat(i));
+                        }
+                        resp.context_menu(|ui| {
+                            if ui.button("Close").clicked() {
+                                acts.push(Action::CloseChat(i));
+                                ui.close();
+                            }
+                            if ui.button("New session").clicked() {
+                                acts.push(Action::NewSession);
+                                ui.close();
+                            }
+                        });
                     }
                     for (i, d) in p.docs.iter().enumerate() {
                         let active = p.active_doc == Some(i);
@@ -1122,10 +1238,15 @@ impl IdeApp {
 
     /// Left tool window: plan usage, new session, all past sessions of the project.
     fn claude_panel(&mut self, ui: &mut Ui, pal: &Palette) {
-        // plan limits are account-wide: take the freshest report from any project
-        let mut limits: Vec<RateLimit> = vec![];
-        for p in &self.projects {
-            for r in p.chat.rate_limits.values() {
+        // account-wide figures from Anthropic (every client, like Claude Code's /usage);
+        // until they load, the freshest rate_limit_event from any of our projects
+        let (mut limits, plan_error, plan_fetched) = {
+            let s = self.plan.state.lock().unwrap();
+            (s.limits.clone(), s.error.clone(), s.fetched)
+        };
+        let plan_busy = self.plan.busy();
+        if plan_fetched.is_none() {
+            for r in self.projects.iter().flat_map(|p| &p.chats).flat_map(|c| c.rate_limits.values()) {
                 match limits.iter_mut().find(|l| l.kind == r.kind) {
                     Some(l) if l.at < r.at => *l = r.clone(),
                     Some(_) => {}
@@ -1133,11 +1254,10 @@ impl IdeApp {
                 }
             }
         }
-        limits.sort_by_key(|l| (l.kind != "five_hour", l.kind.clone()));
-        let total_cost: f64 = self.projects.iter().map(|p| p.chat.usage.cost_usd).sum();
+        limits.sort_by_key(|l| plan::order(&l.kind));
+        let total_cost: f64 = self.projects.iter().flat_map(|p| &p.chats).map(|c| c.usage.cost_usd).sum();
         let multi = self.projects.len() > 1;
         let p = &mut self.projects[self.active];
-        let mut show_claude = false;
 
         ui.horizontal(|ui| {
             ui.label(RichText::new("✻").color(claude_ui::CLAUDE).size(16.0));
@@ -1146,26 +1266,37 @@ impl IdeApp {
         ui.add_space(6.0);
         let new_btn = egui::Button::new(RichText::new("✚  New session").color(Color32::WHITE)).fill(pal.accent);
         if ui.add_sized(vec2(ui.available_width(), 28.0), new_btn).clicked() {
-            p.chat.new_chat();
-            show_claude = true;
+            p.new_session();
         }
 
         ui.add_space(10.0);
-        ui.label(RichText::new("USAGE").small().strong().color(pal.text_weak));
+        let mut refresh_plan = false;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("USAGE").small().strong().color(pal.text_weak))
+                .on_hover_text("Plan limits for the whole account: every Claude Code session, IDE and claude.ai");
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if plan_busy {
+                    ui.add(egui::Spinner::new().size(12.0));
+                } else if ui.small_button("⟳").on_hover_text("Refresh usage").clicked() {
+                    refresh_plan = true;
+                }
+                if let Some(t) = plan_fetched {
+                    let s = t.elapsed().as_secs();
+                    let ago = if s < 60 { "just now".to_owned() } else { format!("{} min ago", s / 60) };
+                    ui.label(RichText::new(format!("updated {ago}")).small().color(pal.text_weak));
+                }
+            });
+        });
         ui.add_space(2.0);
-        if limits.is_empty() {
+        if let Some(e) = &plan_error {
+            ui.add(egui::Label::new(RichText::new(format!("Account usage unavailable: {e}")).small().color(pal.warn)).wrap());
+        }
+        if limits.is_empty() && !plan_busy {
             ui.label(RichText::new("Plan limits show up after the next reply from Claude.").small().color(pal.text_weak));
         }
         let now = util::unix_now();
         for l in &limits {
-            let name = match l.kind.as_str() {
-                "five_hour" => "Current session (5 h)".to_owned(),
-                "seven_day" => "Week · all models".to_owned(),
-                "seven_day_opus" => "Week · Opus".to_owned(),
-                "seven_day_sonnet" => "Week · Sonnet".to_owned(),
-                "overage" => "Extra usage".to_owned(),
-                k => k.replace('_', " "),
-            };
+            let name = plan::label(&l.kind);
             let col = match l.status.as_str() {
                 "rejected" => pal.error,
                 "allowed_warning" => pal.warn,
@@ -1194,7 +1325,11 @@ impl IdeApp {
             }
             ui.add_space(4.0);
         }
-        let u = p.chat.usage;
+        if refresh_plan {
+            self.plan.refresh(ui.ctx());
+        }
+        let p = &mut self.projects[self.active];
+        let u = p.chat().usage;
         let k = |n: u64| if n >= 1000 { format!("{:.1}k", n as f64 / 1000.0) } else { n.to_string() };
         ui.add(
             egui::Label::new(
@@ -1221,22 +1356,23 @@ impl IdeApp {
             ui.label(RichText::new("SESSIONS").small().strong().color(pal.text_weak));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui.small_button("⟳").on_hover_text("Refresh").clicked() {
-                    p.chat.history_at = None;
+                    p.chat_mut().history_at = None;
                 }
             });
         });
-        if p.chat.history_at.is_none_or(|t| t.elapsed().as_secs() > 15) {
-            p.chat.history = crate::claude::list_sessions(&p.root);
-            p.chat.history_at = Some(std::time::Instant::now());
+        if p.chat().history_at.is_none_or(|t| t.elapsed().as_secs() > 15) {
+            let h = crate::claude::list_sessions(&p.root);
+            let c = p.chat_mut();
+            c.history = h;
+            c.history_at = Some(std::time::Instant::now());
         }
-        if p.chat.history.is_empty() {
+        if p.chat().history.is_empty() {
             ui.label(RichText::new("No saved conversations for this folder").small().color(pal.text_weak));
         }
         let mut pick = None;
         egui::ScrollArea::vertical().id_salt("claude_sessions").auto_shrink([false, false]).show(ui, |ui| {
-            for s in &p.chat.history {
-                let current = p.chat.session_id.as_deref() == Some(s.id.as_str())
-                    || (p.chat.session_id.is_none() && p.chat.resume_id.as_deref() == Some(s.id.as_str()));
+            for s in &p.chat().history {
+                let current = p.active_doc.is_none() && p.chat().holds_session(&s.id);
                 let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::click());
                 if current {
                     ui.painter().rect_filled(rect, 5.0, pal.selection);
@@ -1252,15 +1388,7 @@ impl IdeApp {
             }
         });
         if let Some(id) = pick {
-            if p.chat.busy {
-                self.message = Some(("Claude is still working — stop it before switching conversations".into(), true));
-            } else {
-                p.chat.open_session(&id);
-                show_claude = true;
-            }
-        }
-        if show_claude {
-            self.show_claude();
+            p.open_session(&id);
         }
     }
 
@@ -1553,13 +1681,17 @@ impl IdeApp {
                     let name = self.projects.get(self.active).and_then(|p| p.docs.get(*i)).map(|d| d.title.clone()).unwrap_or_default();
                     ("Unsaved changes".into(), format!("Save changes to {name}?"), "Save")
                 }
+                Confirm::CloseChat(i) => {
+                    let name = self.projects.get(self.active).and_then(|p| p.chats.get(*i)).and_then(|c| c.title()).unwrap_or_else(|| "this conversation".into());
+                    ("Close conversation".into(), format!("Claude is still working on \"{name}\".\nClosing the tab stops it."), "Close")
+                }
                 Confirm::CloseProject(i) => {
                     let p = &self.projects[*i];
-                    ("Close project".into(), format!("Close {}?{}{}", p.name, if p.dirty_count() > 0 { format!("\n{} unsaved file(s) will be lost.", p.dirty_count()) } else { String::new() }, if p.chat.busy { "\nIts running Claude task will be stopped." } else { "" }), "Close")
+                    ("Close project".into(), format!("Close {}?{}{}", p.name, if p.dirty_count() > 0 { format!("\n{} unsaved file(s) will be lost.", p.dirty_count()) } else { String::new() }, if p.busy() { "\nIts running Claude tasks will be stopped." } else { "" }), "Close")
                 }
                 Confirm::Exit => {
                     let dirty: usize = self.projects.iter().map(|p| p.dirty_count()).sum();
-                    let busy = self.projects.iter().filter(|p| p.chat.busy).count();
+                    let busy: usize = self.projects.iter().map(|p| p.chats.iter().filter(|c| c.busy).count()).sum();
                     ("Exit VibeStorm".into(), format!("{}{}", if dirty > 0 { format!("{dirty} unsaved file(s).\n") } else { String::new() }, if busy > 0 { format!("{busy} Claude task(s) still running.") } else { String::new() }), "Save all & exit")
                 }
             };
@@ -1835,6 +1967,7 @@ impl IdeApp {
                 }
                 self.close_tab(i, true);
             }
+            Confirm::CloseChat(i) => self.close_chat(i, true),
             Confirm::CloseProject(i) => self.close_project(i, true),
             Confirm::Exit => {
                 if primary {
@@ -1858,8 +1991,8 @@ impl IdeApp {
                 // other open conversations keep theirs
                 Action::ClaudeMode(m) => {
                     if let Some(p) = self.proj() {
-                        if p.chat.mode != m {
-                            p.chat.set_mode(&m);
+                        if p.chat().mode != m {
+                            p.chat_mut().set_mode(&m);
                         }
                     }
                     self.settings.claude_mode = m;
@@ -1867,8 +2000,8 @@ impl IdeApp {
                 }
                 Action::ClaudeModel(m) => {
                     if let Some(p) = self.proj() {
-                        if p.chat.model != m {
-                            p.chat.set_model(&m);
+                        if p.chat().model != m {
+                            p.chat_mut().set_model(&m);
                         }
                     }
                     self.settings.claude_model = m;
@@ -1919,6 +2052,22 @@ impl IdeApp {
                 }
                 Action::CloseProject(i) => self.close_project(i, false),
                 Action::CloseTab(i) => self.close_tab(i, false),
+                Action::ShowChat(i) => {
+                    if let Some(p) = self.proj() {
+                        p.show_chat(i);
+                    }
+                }
+                Action::CloseChat(i) => self.close_chat(i, false),
+                Action::NewSession => {
+                    if let Some(p) = self.proj() {
+                        p.new_session();
+                    }
+                }
+                Action::OpenSession(id) => {
+                    if let Some(p) = self.proj() {
+                        p.open_session(&id);
+                    }
+                }
                 Action::CloseOthers(i) => {
                     if let Some(p) = self.proj() {
                         let keep = p.docs.remove(i);
@@ -1941,13 +2090,12 @@ impl IdeApp {
                 Action::Copy(s) => ctx.copy_text(s),
                 Action::AskClaude(rel) => {
                     if let Some(p) = self.proj() {
-                        p.active_doc = None;
-                        if !p.chat.input.is_empty() && !p.chat.input.ends_with(' ') {
-                            p.chat.input.push(' ');
+                        p.show_chat(p.active_chat);
+                        let c = p.chat_mut();
+                        if !c.input.is_empty() && !c.input.ends_with(' ') {
+                            c.input.push(' ');
                         }
-                        p.chat.input.push_str(&format!("@{rel} "));
-                        let id = Id::new(("claude_input", p.root.clone()));
-                        ctx.memory_mut(|m| m.request_focus(id));
+                        c.input.push_str(&format!("@{rel} "));
                     }
                 }
                 Action::SaveAll => self.save_all(),
@@ -2077,11 +2225,14 @@ impl eframe::App for IdeApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let mut notes: Vec<(String, String, usize, Color32)> = vec![];
         let mut attention = false;
+        let mut replied = false;
         for (i, p) in self.projects.iter_mut().enumerate() {
             let mut touched = false;
-            for s in p.chat.poll() {
+            let signals: Vec<Signal> = p.chats.iter_mut().flat_map(|c| c.poll()).collect();
+            for s in signals {
                 match s {
                     Signal::Done { summary, is_error } => {
+                        replied = true;
                         p.attention = if is_error { Attention::Error } else { Attention::Done };
                         let t = if is_error { format!("✖ {} — Claude stopped", p.name) } else { format!("✔ {} — Claude finished", p.name) };
                         notes.push((t, util::truncate(&summary, 180), i, if is_error { FOLDER_ALERT } else { FOLDER_DONE }));
@@ -2104,16 +2255,25 @@ impl eframe::App for IdeApp {
                 p.git.refresh_status();
             }
             p.find.poll();
-            if touched || p.chat.busy {
+            if touched || p.busy() {
                 p.last_active = util::unix_now();
             }
-            if p.chat.busy {
+            if p.busy() {
                 p.attention = Attention::None; // a new task started
             }
         }
         for (t, b, i, col) in notes {
             self.notify(ctx, &t, &b, i, col);
         }
+        // plan usage: every minute while the panel is open, after replies, else every 5 min
+        let panel = self.left == Some(LeftTab::Claude);
+        let max_age = match (panel, replied) {
+            (_, true) => Duration::from_secs(10),
+            (true, _) => Duration::from_secs(60),
+            _ => Duration::from_secs(300),
+        };
+        self.plan.refresh_if_older(max_age, ctx);
+        ctx.request_repaint_after(if panel { Duration::from_secs(30) } else { max_age });
         // a Windows toast was clicked → bring the window up on that project
         while let Ok(root) = self.toast_click_rx.try_recv() {
             if let Some(i) = self.projects.iter().position(|p| p.root == root) {
@@ -2125,7 +2285,7 @@ impl eframe::App for IdeApp {
         if attention && !self.focused {
             ctx.send_viewport_cmd(ViewportCommand::RequestUserAttention(egui::UserAttentionType::Informational));
         }
-        if self.projects.iter().any(|p| p.chat.busy || !p.git.busy.is_empty()) {
+        if self.projects.iter().any(|p| p.busy() || !p.git.busy.is_empty()) {
             // gentle animation tick instead of continuous repainting
             ctx.request_repaint_after(Duration::from_millis(160));
         }
@@ -2164,7 +2324,7 @@ impl eframe::App for IdeApp {
         // close request
         if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close {
             let dirty = self.projects.iter().any(|p| p.dirty_count() > 0);
-            let busy = self.projects.iter().any(|p| p.chat.busy);
+            let busy = self.projects.iter().any(|p| p.busy());
             if dirty || busy {
                 ctx.send_viewport_cmd(ViewportCommand::CancelClose);
                 self.confirm = Some(Confirm::Exit);
@@ -2185,7 +2345,7 @@ impl eframe::App for IdeApp {
                 let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
                 if let Some(p) = self.projects.get_mut(self.active) {
                     match std::fs::read(&path).map_err(|e| e.to_string()).and_then(|b| crate::claude::prepare_image(&ctx, &name, b)) {
-                        Ok(a) => p.chat.attachments.push(a),
+                        Ok(a) => p.chat_mut().attachments.push(a),
                         Err(e) => self.message = Some((e, true)),
                     }
                 }
@@ -2204,9 +2364,11 @@ impl eframe::App for IdeApp {
         }
 
         for p in &mut self.projects {
-            if std::mem::take(&mut p.chat.take_defaults) {
-                p.chat.model = self.settings.claude_model.clone();
-                p.chat.mode = self.settings.claude_mode.clone();
+            for c in &mut p.chats {
+                if std::mem::take(&mut c.take_defaults) {
+                    c.model = self.settings.claude_model.clone();
+                    c.mode = self.settings.claude_mode.clone();
+                }
             }
         }
 
@@ -2239,7 +2401,6 @@ impl eframe::App for IdeApp {
                         if Self::stripe_button(ui, &pal, "✔", "Commit (Alt+0)", self.left == Some(LeftTab::Commit)) {
                             self.left = if self.left == Some(LeftTab::Commit) { None } else { Some(LeftTab::Commit) };
                         }
-                        ui.add_space(12.0);
                         if Self::stripe_button(ui, &pal, "⎇", "Git log (Alt+9)", self.left == Some(LeftTab::Log)) {
                             self.left = if self.left == Some(LeftTab::Log) { None } else { Some(LeftTab::Log) };
                         }
@@ -2251,7 +2412,6 @@ impl eframe::App for IdeApp {
                                 }
                             }
                         }
-                        ui.add_space(12.0);
                         let on = self.left == Some(LeftTab::Claude);
                         if Self::stripe_button_col(ui, &pal, "✻", "Claude Code: usage & sessions (Alt+3)", on, Some(claude_ui::CLAUDE)) {
                             self.left = if on { None } else { Some(LeftTab::Claude) };
@@ -2361,18 +2521,21 @@ impl eframe::App for IdeApp {
                     }
                     None => {
                         p.active_doc = None; // a stale index falls back to the Claude tab
-                        p.chat.unseen = false;
+                        p.chat_mut().unseen = false;
                         let last = p.last_session.clone();
                         let active_file = p
                             .last_file
                             .as_ref()
                             .filter(|f| p.docs.iter().any(|d| &d.path == *f))
                             .map(|f| util::rel_path(&p.root, f));
-                        for a in claude_ui::show(ui, &mut p.chat, &pal, last, active_file) {
+                        let chat = &mut p.chats[p.active_chat];
+                        for a in claude_ui::show(ui, chat, &pal, last, active_file) {
                             match a {
                                 ChatAction::OpenFile(f) => acts.push(Action::OpenFile(f, None)),
                                 ChatAction::SetMode(m) => acts.push(Action::ClaudeMode(m)),
                                 ChatAction::SetModel(m) => acts.push(Action::ClaudeModel(m)),
+                                ChatAction::NewSession => acts.push(Action::NewSession),
+                                ChatAction::OpenSession(id) => acts.push(Action::OpenSession(id)),
                             }
                         }
                     }

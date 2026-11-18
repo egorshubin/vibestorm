@@ -20,6 +20,10 @@ pub enum ChatAction {
     SetMode(String),
     /// new default model for every project (saved in settings)
     SetModel(String),
+    /// start a fresh conversation in its own tab
+    NewSession,
+    /// show a stored conversation (in its tab if one is open, else in a new one)
+    OpenSession(String),
 }
 
 enum Act {
@@ -195,6 +199,7 @@ pub fn show(
     let mut acts: Vec<Act> = vec![];
     let now = ui.input(|i| i.time);
     let cwd = chat.cwd.clone();
+    let uid = chat.uid;
 
     // ---------------- header: conversation title + history + new
     egui::Panel::top("claude_header")
@@ -206,8 +211,8 @@ pub fn show(
                 let title = chat.title().unwrap_or_else(|| "New conversation".into());
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 1.0;
-                    if tool_btn(ui, pal, "✚", "New conversation", true) {
-                        chat.new_chat();
+                    if tool_btn(ui, pal, "✚", "New session", true) {
+                        out.push(ChatAction::NewSession);
                     }
                     let hist = ui.menu_button(RichText::new("🕘").size(13.0), |ui| {
                         ui.set_min_width(320.0);
@@ -223,8 +228,7 @@ pub fn show(
                         let mut pick = None;
                         egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
                             for s in &chat.history {
-                                let current = chat.session_id.as_deref() == Some(s.id.as_str())
-                                    || (chat.session_id.is_none() && chat.resume_id.as_deref() == Some(s.id.as_str()));
+                                let current = chat.holds_session(&s.id);
                                 let label = format!("{}\n{}", s.title, crate::util::fmt_ago(s.modified));
                                 if ui.add(egui::Button::selectable(current, label).wrap()).clicked() {
                                     pick = Some(s.id.clone());
@@ -241,7 +245,7 @@ pub fn show(
                             ui.close();
                         }
                         if let Some(id) = pick {
-                            chat.open_session(&id);
+                            out.push(ChatAction::OpenSession(id));
                         }
                     });
                     hist.response.on_hover_text("Past conversations");
@@ -278,7 +282,7 @@ pub fn show(
         .frame(Frame::NONE.inner_margin(Margin { left: 8, right: 8, top: 4, bottom: 8 }))
         .show_separator_line(false)
         .show(ui, |ui| {
-            let input_id = Id::new(("claude_input", cwd.clone()));
+            let input_id = chat.input_id();
             if std::mem::take(&mut chat.focus_input) {
                 ui.memory_mut(|m| m.request_focus(input_id));
             }
@@ -341,7 +345,7 @@ pub fn show(
                         }
                         ui.add_space(4.0);
                     }
-                    egui::ScrollArea::vertical().id_salt(("claude_input_scroll", cwd.clone())).max_height(220.0).show(ui, |ui| {
+                    egui::ScrollArea::vertical().id_salt(("claude_input_scroll", uid)).max_height(220.0).show(ui, |ui| {
                         ui.add(
                             egui::TextEdit::multiline(&mut chat.input)
                                 .id(input_id)
@@ -438,7 +442,7 @@ pub fn show(
         .show(ui, |ui| {
             let Chat { items, md_cache, live_text, busy, .. } = chat;
             egui::ScrollArea::vertical()
-                .id_salt(("claude_msgs", cwd.clone()))
+                .id_salt(("claude_msgs", uid))
                 .stick_to_bottom(true)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
@@ -508,7 +512,7 @@ pub fn show(
                                     Some((_, false)) => pal.success,
                                 };
                                 let summary = claude::tool_summary(name, input, &cwd);
-                                let open_id = Id::new(("tool_open", cwd.clone(), idx));
+                                let open_id = Id::new(("tool_open", uid, idx));
                                 // edits start expanded (inline diff), like in VS Code
                                 let default_open = matches!(name.as_str(), "Edit" | "MultiEdit" | "Write");
                                 let mut open = ui.data(|d| d.get_temp::<bool>(open_id)).unwrap_or(default_open);

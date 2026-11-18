@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::Instant;
 
@@ -133,6 +134,8 @@ pub enum Signal {
 }
 
 pub struct Chat {
+    /// unique per conversation tab: keys its widget state (several tabs share one cwd)
+    pub uid: u64,
     pub cwd: PathBuf,
     pub items: Vec<Item>,
     pub input: String,
@@ -208,7 +211,9 @@ pub fn one_shot(cwd: &Path, prompt: &str, model: &str) -> Result<String, String>
 
 impl Chat {
     pub fn new(cwd: PathBuf, ctx: egui::Context, model: String, mode: String, resume: Option<String>) -> Self {
+        static NEXT_UID: AtomicU64 = AtomicU64::new(1);
         Self {
+            uid: NEXT_UID.fetch_add(1, Ordering::Relaxed),
             cwd,
             items: vec![],
             input: String::new(),
@@ -400,6 +405,27 @@ impl Chat {
                 self.mark(&id, PermState::Denied);
             }
         }
+    }
+
+    /// A fresh conversation in the same folder; it picks up the saved default model and mode.
+    pub fn sibling(&self) -> Chat {
+        let mut c = Chat::new(self.cwd.clone(), self.ctx.clone(), self.model.clone(), self.mode.clone(), None);
+        c.take_defaults = true;
+        c
+    }
+
+    /// Nothing typed, sent or restored yet: safe to reuse for another conversation.
+    pub fn is_blank(&self) -> bool {
+        self.items.is_empty() && !self.busy && self.session.is_none() && self.resume_id.is_none() && self.input.is_empty() && self.attachments.is_empty()
+    }
+
+    /// This tab holds the stored conversation `id` (running or waiting to resume).
+    pub fn holds_session(&self, id: &str) -> bool {
+        self.session_id.as_deref() == Some(id) || (self.session_id.is_none() && self.resume_id.as_deref() == Some(id))
+    }
+
+    pub fn input_id(&self) -> egui::Id {
+        egui::Id::new(("claude_input", self.uid))
     }
 
     /// Kill the process and start fresh.
