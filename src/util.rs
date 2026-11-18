@@ -216,6 +216,62 @@ pub fn kill_with_ide(child: &std::process::Child) {
     }
 }
 
+/// Make the next file dialog this process opens (within a few seconds) tall: 85% of its
+/// monitor's work area, about twice the Windows default. rfd can't size the dialog, so
+/// a helper thread waits for the window to appear and resizes it.
+#[cfg(windows)]
+pub fn tall_file_dialog() {
+    use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT};
+    use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow};
+    use windows_sys::Win32::UI::WindowsAndMessaging::*;
+
+    // a visible dialog-class (#32770) window of this process
+    unsafe extern "system" fn find(hwnd: HWND, out: LPARAM) -> windows_sys::core::BOOL {
+        let mut pid = 0;
+        unsafe {
+            GetWindowThreadProcessId(hwnd, &mut pid);
+            if pid != std::process::id() || IsWindowVisible(hwnd) == 0 {
+                return 1;
+            }
+            let mut class = [0u16; 16];
+            let n = GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32);
+            if class[..n.max(0) as usize] == *"#32770".encode_utf16().collect::<Vec<_>>() {
+                *(out as *mut HWND) = hwnd;
+                return 0;
+            }
+        }
+        1
+    }
+
+    std::thread::spawn(|| unsafe {
+        for _ in 0..100 {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            let mut hwnd: HWND = std::ptr::null_mut();
+            EnumWindows(Some(find), &mut hwnd as *mut HWND as LPARAM);
+            if hwnd.is_null() {
+                continue;
+            }
+            let mut r: RECT = std::mem::zeroed();
+            let mut mi: MONITORINFO = std::mem::zeroed();
+            mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+            if GetWindowRect(hwnd, &mut r) == 0 || GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut mi) == 0 {
+                return;
+            }
+            let work = mi.rcWork;
+            let target = (work.bottom - work.top) * 85 / 100;
+            if r.bottom - r.top < target {
+                // keep it vertically centred on the monitor
+                let top = work.top + (work.bottom - work.top - target) / 2;
+                SetWindowPos(hwnd, std::ptr::null_mut(), r.left, top, r.right - r.left, target, SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+            return;
+        }
+    });
+}
+
+#[cfg(not(windows))]
+pub fn tall_file_dialog() {}
+
 /// Write the app icon as a .ico file (used for desktop / Start menu shortcuts).
 pub fn write_icon(path: &Path) -> Result<(), String> {
     let ic = app_icon();

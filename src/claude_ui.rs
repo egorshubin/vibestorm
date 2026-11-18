@@ -84,6 +84,16 @@ fn code_block(ui: &mut Ui, pal: &Palette, label: &str, text: &str, max_lines: us
     });
 }
 
+/// Claude's markdown. egui_commonmark lays out every styled run as its own label and
+/// the wrapping row centres them, which lifts monospace `code` above the text line;
+/// bottom alignment puts Segoe UI and the monospace font on the same baseline.
+fn markdown(ui: &mut Ui, cache: &mut egui_commonmark::CommonMarkCache, text: &str) {
+    ui.scope(|ui| {
+        ui.style_mut().override_text_valign = Some(Align::BOTTOM);
+        egui_commonmark::CommonMarkViewer::new().show(ui, cache, text);
+    });
+}
+
 /// Line diff by trimming the common head/tail (good enough for Edit tool hunks).
 fn diff_lines<'a>(old: &'a str, new: &'a str) -> Vec<(char, &'a str)> {
     let a: Vec<&str> = old.lines().collect();
@@ -391,6 +401,7 @@ pub fn show(
                             }
                         }
                         if chip(ui, pal, "📎", "Attach images (or paste with Ctrl+V)").clicked() {
+                            crate::util::tall_file_dialog();
                             if let Some(files) = rfd::FileDialog::new()
                                 .add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp", "bmp"])
                                 .pick_files()
@@ -493,7 +504,7 @@ pub fn show(
                                 ui.horizontal_top(|ui| {
                                     ui.label(RichText::new("●").size(10.0).color(pal.text));
                                     ui.vertical(|ui| {
-                                        egui_commonmark::CommonMarkViewer::new().show(ui, md_cache, text);
+                                        markdown(ui, md_cache, text);
                                     });
                                 });
                                 ui.add_space(4.0);
@@ -577,7 +588,7 @@ pub fn show(
                                         ui.label(RichText::new(title).strong());
                                         ui.add_space(4.0);
                                         if plan {
-                                            egui_commonmark::CommonMarkViewer::new().show(ui, md_cache, input["plan"].as_str().unwrap_or(""));
+                                            markdown(ui, md_cache, input["plan"].as_str().unwrap_or(""));
                                         } else {
                                             tool_body(ui, pal, tool, input, &None, &cwd);
                                         }
@@ -682,7 +693,7 @@ pub fn show(
                         ui.horizontal_top(|ui| {
                             ui.label(RichText::new("●").size(10.0).color(pal.text));
                             ui.vertical(|ui| {
-                                egui_commonmark::CommonMarkViewer::new().show(ui, md_cache, live_text);
+                                markdown(ui, md_cache, live_text);
                             });
                         });
                     }

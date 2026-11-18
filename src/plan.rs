@@ -15,6 +15,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const URL: &str = "https://api.anthropic.com/api/oauth/usage";
+/// The endpoint rate-limits (HTTP 429) when polled often; after that we wait this long.
+const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Default)]
 pub struct PlanState {
@@ -27,11 +29,13 @@ pub struct PlanUsage {
     pub state: Arc<Mutex<PlanState>>,
     busy: Arc<Mutex<bool>>,
     last_try: Option<Instant>,
+    /// set by an HTTP 429: no automatic refresh before this
+    backoff_until: Arc<Mutex<Option<Instant>>>,
 }
 
 impl PlanUsage {
     pub fn new() -> Self {
-        PlanUsage { state: Arc::default(), busy: Arc::default(), last_try: None }
+        PlanUsage { state: Arc::default(), busy: Arc::default(), last_try: None, backoff_until: Arc::default() }
     }
 
     pub fn busy(&self) -> bool {
@@ -40,7 +44,8 @@ impl PlanUsage {
 
     /// Fetch again if the last attempt is older than `max_age`.
     pub fn refresh_if_older(&mut self, max_age: Duration, ctx: &egui::Context) {
-        if self.last_try.is_none_or(|t| t.elapsed() >= max_age) {
+        let backing_off = self.backoff_until.lock().unwrap().is_some_and(|t| Instant::now() < t);
+        if !backing_off && self.last_try.is_none_or(|t| t.elapsed() >= max_age) {
             self.refresh(ctx);
         }
     }
@@ -51,7 +56,7 @@ impl PlanUsage {
         }
         self.last_try = Some(Instant::now());
         *self.busy.lock().unwrap() = true;
-        let (state, busy, ctx) = (self.state.clone(), self.busy.clone(), ctx.clone());
+        let (state, busy, backoff, ctx) = (self.state.clone(), self.busy.clone(), self.backoff_until.clone(), ctx.clone());
         std::thread::spawn(move || {
             let res = fetch();
             {
@@ -62,7 +67,11 @@ impl PlanUsage {
                         s.error = None;
                         s.fetched = Some(Instant::now());
                     }
-                    Err(e) => s.error = Some(e),
+                    // not a real problem: keep the last figures and quietly try again later
+                    Err(FetchError::RateLimited) => {
+                        *backoff.lock().unwrap() = Some(Instant::now() + RATE_LIMIT_BACKOFF);
+                    }
+                    Err(FetchError::Other(e)) => s.error = Some(e),
                 }
             }
             *busy.lock().unwrap() = false;
@@ -79,7 +88,24 @@ fn credentials_path() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".claude").join(".credentials.json"))
 }
 
-fn fetch() -> Result<Vec<RateLimit>, String> {
+enum FetchError {
+    RateLimited,
+    Other(String),
+}
+
+impl From<String> for FetchError {
+    fn from(e: String) -> Self {
+        FetchError::Other(e)
+    }
+}
+
+impl From<&str> for FetchError {
+    fn from(e: &str) -> Self {
+        FetchError::Other(e.to_owned())
+    }
+}
+
+fn fetch() -> Result<Vec<RateLimit>, FetchError> {
     let path = credentials_path().ok_or("no home folder")?;
     let text = std::fs::read_to_string(&path).map_err(|_| "not signed in to Claude Code (no ~/.claude/.credentials.json)".to_owned())?;
     let creds: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("bad credentials file: {e}"))?;
@@ -106,10 +132,11 @@ fn fetch() -> Result<Vec<RateLimit>, String> {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let (body, code) = stdout.trim_end().rsplit_once('\n').unwrap_or(("", stdout.trim()));
     match code.trim() {
-        "200" => parse(body),
-        "000" | "" => Err(format!("network error: {}", String::from_utf8_lossy(&out.stderr).trim())),
+        "200" => Ok(parse(body)?),
+        "429" => Err(FetchError::RateLimited),
+        "000" | "" => Err(format!("network error: {}", String::from_utf8_lossy(&out.stderr).trim()).into()),
         "401" => Err("sign-in expired; it renews the next time Claude runs".into()),
-        c => Err(format!("HTTP {c}: {}", crate::util::truncate(body.trim(), 160))),
+        c => Err(format!("HTTP {c}: {}", crate::util::truncate(body.trim(), 160)).into()),
     }
 }
 

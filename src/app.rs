@@ -355,19 +355,51 @@ fn setup_fonts(ctx: &egui::Context) {
         None
     };
     let fam = |f: FontFamily, p: FontPriority| InsertFontFamily { family: f, priority: p };
+    let md_code = || FontFamily::Name(theme::MD_CODE_FAMILY.into());
+    let mut text_below = None;
     if let Some((n, b)) = read(&["segoeui.ttf"]) {
+        text_below = below_baseline_em(&b);
         ctx.add_font(FontInsert::new(&n, FontData::from_owned(b), vec![fam(FontFamily::Proportional, FontPriority::Highest)]));
     }
     if let Some((n, b)) = read(&["JetBrainsMono-Regular.ttf", "CascadiaMono.ttf", "CascadiaCode.ttf", "consola.ttf"]) {
+        // Inline code in markdown sits in the same row as Segoe UI text, bottom-aligned.
+        // egui ends a row at descent + line gap below the baseline, and Consolas has a
+        // big line gap (Segoe UI none), so its baseline would float ~0.17em too high:
+        // a copy shifted down by the difference puts both on one baseline.
+        if let (Some(t), Some(m)) = (text_below, below_baseline_em(&b)) {
+            let tweak = egui::FontTweak { y_offset_factor: m - t, ..Default::default() };
+            let data = FontData::from_owned(b.clone()).tweak(tweak);
+            ctx.add_font(FontInsert::new(&format!("{n} (md code)"), data, vec![fam(md_code(), FontPriority::Highest)]));
+            theme::MD_CODE_FONT.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         ctx.add_font(FontInsert::new(&n, FontData::from_owned(b), vec![fam(FontFamily::Monospace, FontPriority::Highest)]));
     }
     if let Some((n, b)) = read(&["seguisym.ttf"]) {
-        ctx.add_font(FontInsert::new(
-            &n,
-            FontData::from_owned(b),
-            vec![fam(FontFamily::Proportional, FontPriority::Lowest), fam(FontFamily::Monospace, FontPriority::Lowest)],
-        ));
+        let mut families = vec![fam(FontFamily::Proportional, FontPriority::Lowest), fam(FontFamily::Monospace, FontPriority::Lowest)];
+        if theme::MD_CODE_FONT.load(std::sync::atomic::Ordering::Relaxed) {
+            families.push(fam(md_code(), FontPriority::Lowest));
+        }
+        ctx.add_font(FontInsert::new(&n, FontData::from_owned(b), families));
     }
+}
+
+/// (descent + line gap) / units-per-em from a TrueType font's `head` and `hhea` tables:
+/// how far below the baseline egui ends a text row of this font, in font sizes.
+fn below_baseline_em(font: &[u8]) -> Option<f32> {
+    let u16_at = |o: usize| font.get(o..o + 2).map(|b| u16::from_be_bytes([b[0], b[1]]));
+    let i16_at = |o: usize| u16_at(o).map(|v| v as i16);
+    let u32_at = |o: usize| font.get(o..o + 4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+    let table = |tag: &[u8]| {
+        (0..u16_at(4)? as usize)
+            .map(|i| 12 + 16 * i)
+            .find(|&r| font.get(r..r + 4) == Some(tag))
+            .and_then(|r| u32_at(r + 8))
+            .map(|o| o as usize)
+    };
+    let upm = u16_at(table(b"head")? + 18)? as f32;
+    let hhea = table(b"hhea")?;
+    let (descender, line_gap) = (i16_at(hhea + 6)? as f32, i16_at(hhea + 8)? as f32);
+    (upm > 0.0).then(|| (line_gap - descender) / upm)
 }
 
 impl IdeApp {
@@ -1048,10 +1080,19 @@ impl IdeApp {
     }
 
     fn stripe_button(ui: &mut Ui, pal: &Palette, icon: &str, tip: &str, on: bool) -> bool {
-        Self::stripe_button_col(ui, pal, icon, tip, on, None)
+        Self::stripe_button_col(ui, pal, icon, tip, on, None, 0)
     }
 
-    fn stripe_button_col(ui: &mut Ui, pal: &Palette, icon: &str, tip: &str, on: bool, color: Option<Color32>) -> bool {
+    /// `badge` > 0 draws a counter pill on the icon's top-right corner.
+    fn stripe_button_col(
+        ui: &mut Ui,
+        pal: &Palette,
+        icon: &str,
+        tip: &str,
+        on: bool,
+        color: Option<Color32>,
+        badge: usize,
+    ) -> bool {
         let (rect, resp) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::click());
         if on {
             ui.painter().rect_filled(rect, 6.0, pal.selection);
@@ -1060,6 +1101,15 @@ impl IdeApp {
         }
         let col = color.unwrap_or(if on { pal.text } else { pal.text_weak });
         ui.painter().text(rect.center(), Align2::CENTER_CENTER, icon, FontId::proportional(15.0), col);
+        if badge > 0 {
+            let text = if badge > 99 { "99+".to_owned() } else { badge.to_string() };
+            let g = ui.painter().layout_no_wrap(text, FontId::proportional(9.5), Color32::WHITE);
+            let w = (g.size().x + 7.0).max(14.0);
+            let pill = egui::Rect::from_min_size(pos2(rect.max.x - w + 3.0, rect.min.y - 2.0), vec2(w, 14.0));
+            ui.painter().rect_filled(pill.expand(1.5), 8.5, pal.panel_bg);
+            ui.painter().rect_filled(pill, 7.0, pal.accent);
+            ui.painter().galley(pill.center() - g.size() / 2.0, g, Color32::WHITE);
+        }
         resp.on_hover_text(tip).clicked()
     }
 
@@ -2307,13 +2357,10 @@ impl eframe::App for IdeApp {
         for (t, b, i, col) in notes {
             self.notify(ctx, &t, &b, i, col);
         }
-        // plan usage: every minute while the panel is open, after replies, else every 5 min
+        // plan usage: at most once a minute while the panel is open or after replies,
+        // else every 5 min (the endpoint answers HTTP 429 when polled more often)
         let panel = self.left == Some(LeftTab::Claude);
-        let max_age = match (panel, replied) {
-            (_, true) => Duration::from_secs(10),
-            (true, _) => Duration::from_secs(60),
-            _ => Duration::from_secs(300),
-        };
+        let max_age = if panel || replied { Duration::from_secs(60) } else { Duration::from_secs(300) };
         self.plan.refresh_if_older(max_age, ctx);
         ctx.request_repaint_after(if panel { Duration::from_secs(30) } else { max_age });
         // a Windows toast was clicked → bring the window up on that project
@@ -2432,6 +2479,7 @@ impl eframe::App for IdeApp {
             .show(ui, |ui| self.sidebar(ui, &pal, &mut acts));
 
         if !self.projects.is_empty() {
+            let changed = self.projects.get(self.active).map_or(0, |p| p.git.status.files.len());
             egui::Panel::left("stripe_left")
                 .exact_size(38.0)
                 .frame(Frame::NONE.fill(pal.panel_bg).inner_margin(Margin::symmetric(4, 6)))
@@ -2440,7 +2488,12 @@ impl eframe::App for IdeApp {
                         if Self::stripe_button(ui, &pal, "🗀", "Project (Alt+1)", self.left == Some(LeftTab::Project)) {
                             self.left = if self.left == Some(LeftTab::Project) { None } else { Some(LeftTab::Project) };
                         }
-                        if Self::stripe_button(ui, &pal, "✔", "Commit (Alt+0)", self.left == Some(LeftTab::Commit)) {
+                        let tip = match changed {
+                            0 => "Commit (Alt+0)".to_owned(),
+                            n => format!("Commit (Alt+0) · {n} uncommitted files"),
+                        };
+                        let on = self.left == Some(LeftTab::Commit);
+                        if Self::stripe_button_col(ui, &pal, "✔", &tip, on, None, changed) {
                             self.left = if self.left == Some(LeftTab::Commit) { None } else { Some(LeftTab::Commit) };
                         }
                         if Self::stripe_button(ui, &pal, "⎇", "Git log (Alt+9)", self.left == Some(LeftTab::Log)) {
@@ -2455,7 +2508,7 @@ impl eframe::App for IdeApp {
                             }
                         }
                         let on = self.left == Some(LeftTab::Claude);
-                        if Self::stripe_button_col(ui, &pal, "✻", "Claude Code: usage & sessions (Alt+3)", on, Some(claude_ui::CLAUDE)) {
+                        if Self::stripe_button_col(ui, &pal, "✻", "Claude Code: usage & sessions (Alt+3)", on, Some(claude_ui::CLAUDE), 0) {
                             self.left = if on { None } else { Some(LeftTab::Claude) };
                         }
                     });
