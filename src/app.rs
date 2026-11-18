@@ -75,7 +75,9 @@ impl Project {
         };
         // conversation tabs come back as bare session ids: the transcript is read when a tab is
         // first shown, the process starts on the next message
-        for (n, id) in memo.chats.iter().enumerate() {
+        // no saved tab list (older settings, or only blank tabs) → at least the last conversation
+        let chats: Vec<String> = if memo.chats.is_empty() { memo.last_session.iter().cloned().collect() } else { memo.chats.clone() };
+        for (n, id) in chats.iter().enumerate() {
             if n > 0 {
                 let c = p.chats[0].sibling();
                 p.chats.push(c);
