@@ -1,0 +1,2179 @@
+//! Main application: multi-project workspace in a single window.
+
+use crate::claude::{Chat, MODELS, MODES, Signal};
+use crate::claude_ui::{self, ChatAction};
+use crate::editor::{self, Doc, EditorCtx};
+use crate::git::{GitFile, GitState, GitUiAction};
+use crate::highlight::Highlighting;
+use crate::search::{self, FileIndex, FindInFiles};
+use crate::settings::{ProjectMemo, Settings};
+use crate::theme::{self, Palette};
+use crate::tree::{FileTree, TreeAction, file_badge};
+use crate::util;
+use eframe::egui::{
+    self, Align, Align2, Color32, FontId, Frame, Id, Key, KeyboardShortcut, Layout, Margin, Modifiers, RichText,
+    Sense, Stroke, Ui, ViewportCommand, pos2, vec2,
+};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+#[derive(PartialEq, Clone, Copy)]
+enum Attention {
+    None,
+    Done,
+    Error,
+}
+
+pub struct Project {
+    pub root: PathBuf,
+    pub name: String,
+    tree: FileTree,
+    docs: Vec<Doc>,
+    active_doc: Option<usize>,
+    git: GitState,
+    chat: Chat,
+    index: FileIndex,
+    find: FindInFiles,
+    attention: Attention,
+    last_session: Option<String>,
+    /// unix secs of the last action in this project
+    last_active: u64,
+}
+
+fn memo_key(p: &Path) -> String {
+    p.to_string_lossy().to_lowercase()
+}
+
+impl Project {
+    fn new(root: PathBuf, ctx: &egui::Context, s: &Settings, hl: &Highlighting) -> Self {
+        let name = root
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| root.display().to_string());
+        let memo = s.memo.get(&memo_key(&root)).cloned().unwrap_or_default();
+        let mut p = Project {
+            name,
+            tree: FileTree::new(root.clone()),
+            docs: vec![],
+            active_doc: None,
+            git: GitState::new(root.clone(), ctx.clone()),
+            chat: Chat::new(root.clone(), ctx.clone(), s.claude_model.clone(), s.claude_mode.clone(), None),
+            index: FileIndex::build(root.clone(), ctx.clone()),
+            find: FindInFiles::default(),
+            attention: Attention::None,
+            last_session: memo.last_session.clone(),
+            last_active: if memo.last_active > 0 { memo.last_active } else { util::unix_now() },
+            root,
+        };
+        for f in &memo.open_files {
+            let path = PathBuf::from(f);
+            if path.is_file() {
+                p.docs.push(Doc::open(&path, hl));
+            }
+        }
+        p.active_doc = memo
+            .active_file
+            .as_ref()
+            .and_then(|a| p.docs.iter().position(|d| d.path.to_string_lossy() == *a))
+            .or(if p.docs.is_empty() { None } else { Some(0) });
+        p
+    }
+
+    fn memo(&self) -> ProjectMemo {
+        ProjectMemo {
+            open_files: self
+                .docs
+                .iter()
+                .filter(|d| !d.is_virtual())
+                .map(|d| d.path.to_string_lossy().into_owned())
+                .collect(),
+            active_file: self
+                .active_doc
+                .and_then(|i| self.docs.get(i))
+                .filter(|d| !d.is_virtual())
+                .map(|d| d.path.to_string_lossy().into_owned()),
+            last_session: self.chat.session_id.clone().or(self.last_session.clone()),
+            last_active: self.last_active,
+        }
+    }
+
+    fn check_disk(&mut self, hl: &Highlighting) {
+        for d in &mut self.docs {
+            d.check_disk(hl);
+        }
+    }
+
+    fn dirty_count(&self) -> usize {
+        self.docs.iter().filter(|d| d.dirty).count()
+    }
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum LeftTab {
+    Project,
+    Commit,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum BottomTab {
+    Git,
+    Find,
+}
+
+enum PromptKind {
+    NewFile(PathBuf),
+    NewFolder(PathBuf),
+    Rename(PathBuf),
+    GotoLine,
+    NewBranch,
+}
+
+struct Prompt {
+    kind: PromptKind,
+    value: String,
+    focus: bool,
+}
+
+enum Confirm {
+    Delete(PathBuf),
+    Rollback(Vec<GitFile>),
+    CloseTab(usize),
+    CloseProject(usize),
+    Exit,
+}
+
+struct QuickOpen {
+    query: String,
+    results: Vec<String>,
+    computed: Option<String>,
+    sel: usize,
+    focus: bool,
+}
+
+enum Action {
+    SwitchView(usize, View),
+    OpenProjectView(PathBuf, View),
+    ForgetRecent(String),
+    OpenFile(PathBuf, Option<usize>),
+    /// open a file and select a search match
+    OpenFileAt { path: PathBuf, line: usize, col: usize, len: usize },
+    OpenDiff { title: String, key: String, text: String },
+    Switch(usize),
+    AddProjectDialog,
+    OpenProject(PathBuf),
+    CloseProject(usize),
+    CloseTab(usize),
+    CloseOthers(usize),
+    Prompt(PromptKind),
+    Confirm(Confirm),
+    Terminal(PathBuf),
+    Reveal(PathBuf),
+    Copy(String),
+    AskClaude(String),
+    SaveAll,
+}
+
+pub struct IdeApp {
+    settings: Settings,
+    hl: Highlighting,
+    projects: Vec<Project>,
+    active: usize,
+    left: Option<LeftTab>,
+    bottom: Option<BottomTab>,
+    claude_open: bool,
+    prompt: Option<Prompt>,
+    confirm: Option<Confirm>,
+    quick: Option<QuickOpen>,
+    show_settings: bool,
+    focused: bool,
+    allow_close: bool,
+    title_for: Option<(usize, String)>,
+    message: Option<(String, bool)>,
+    titlebar_themed: bool,
+    /// in-app notification cards (bottom-right)
+    toasts: Vec<InAppToast>,
+    /// project roots whose Windows toast was clicked
+    toast_click_tx: std::sync::mpsc::Sender<PathBuf>,
+    toast_click_rx: std::sync::mpsc::Receiver<PathBuf>,
+}
+
+struct InAppToast {
+    title: String,
+    body: String,
+    root: PathBuf,
+    color: Color32,
+    at: std::time::Instant,
+}
+
+fn setup_fonts(ctx: &egui::Context) {
+    use egui::{FontData, FontFamily, epaint::text::{FontInsert, FontPriority, InsertFontFamily}};
+    let win = PathBuf::from(std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into())).join("Fonts");
+    let local = std::env::var_os("LOCALAPPDATA")
+        .map(|l| PathBuf::from(l).join("Microsoft").join("Windows").join("Fonts"));
+    let read = |names: &[&str]| -> Option<(String, Vec<u8>)> {
+        for n in names {
+            for d in [Some(win.clone()), local.clone()].into_iter().flatten() {
+                if let Ok(b) = std::fs::read(d.join(n)) {
+                    return Some((n.to_string(), b));
+                }
+            }
+        }
+        None
+    };
+    let fam = |f: FontFamily, p: FontPriority| InsertFontFamily { family: f, priority: p };
+    if let Some((n, b)) = read(&["segoeui.ttf"]) {
+        ctx.add_font(FontInsert::new(&n, FontData::from_owned(b), vec![fam(FontFamily::Proportional, FontPriority::Highest)]));
+    }
+    if let Some((n, b)) = read(&["JetBrainsMono-Regular.ttf", "CascadiaMono.ttf", "CascadiaCode.ttf", "consola.ttf"]) {
+        ctx.add_font(FontInsert::new(&n, FontData::from_owned(b), vec![fam(FontFamily::Monospace, FontPriority::Highest)]));
+    }
+    if let Some((n, b)) = read(&["seguisym.ttf"]) {
+        ctx.add_font(FontInsert::new(
+            &n,
+            FontData::from_owned(b),
+            vec![fam(FontFamily::Proportional, FontPriority::Lowest), fam(FontFamily::Monospace, FontPriority::Lowest)],
+        ));
+    }
+}
+
+impl IdeApp {
+    pub fn new(cc: &eframe::CreationContext<'_>, arg: Option<String>) -> Self {
+        let ctx = cc.egui_ctx.clone();
+        setup_fonts(&ctx);
+        let settings = Settings::load();
+        theme::apply(&ctx, settings.dark, settings.ui_font_size);
+        ctx.send_viewport_cmd(ViewportCommand::SetTheme(if settings.dark { egui::SystemTheme::Dark } else { egui::SystemTheme::Light }));
+        let hl = Highlighting::new();
+        let (toast_click_tx, toast_click_rx) = std::sync::mpsc::channel();
+        let mut app = IdeApp {
+            toasts: vec![],
+            toast_click_tx,
+            toast_click_rx,
+            hl,
+            projects: vec![],
+            active: 0,
+            // VIBESTORM_VIEW=git opens the Commit + Git log tool windows on start
+            left: Some(if std::env::var("VIBESTORM_VIEW").as_deref() == Ok("git") { LeftTab::Commit } else { LeftTab::Project }),
+            bottom: if std::env::var("VIBESTORM_VIEW").as_deref() == Ok("git") { Some(BottomTab::Git) } else { None },
+            claude_open: true,
+            prompt: None,
+            confirm: None,
+            quick: None,
+            show_settings: false,
+            focused: true,
+            allow_close: false,
+            title_for: None,
+            message: None,
+            titlebar_themed: false,
+            settings,
+        };
+        let open: Vec<String> = app.settings.open_projects.clone();
+        for p in open {
+            let pb = PathBuf::from(&p);
+            if pb.is_dir() {
+                app.add_project(pb, &ctx, false);
+            }
+        }
+        app.active = app.settings.active_project.min(app.projects.len().saturating_sub(1));
+        if let Some(p) = app.projects.get_mut(app.active) {
+            p.chat.focus_input = true; // Claude Code is the default view of a project
+        }
+        if let Some(a) = arg {
+            let pb = PathBuf::from(a);
+            if pb.is_dir() {
+                app.add_project(pb, &ctx, true);
+            } else if pb.is_file() {
+                if let Some(parent) = pb.parent() {
+                    app.add_project(parent.to_path_buf(), &ctx, true);
+                    app.open_file(&pb, None);
+                }
+            }
+        }
+        app
+    }
+
+    fn add_project(&mut self, root: PathBuf, ctx: &egui::Context, switch: bool) {
+        let root = std::fs::canonicalize(&root)
+            .map(|p| PathBuf::from(p.to_string_lossy().trim_start_matches(r"\\?\")))
+            .unwrap_or(root);
+        if let Some(i) = self.projects.iter().position(|p| memo_key(&p.root) == memo_key(&root)) {
+            if switch {
+                self.switch(i);
+            }
+            return;
+        }
+        let mut p = Project::new(root.clone(), ctx, &self.settings, &self.hl);
+        if switch {
+            p.last_active = util::unix_now();
+        }
+        self.projects.push(p); // open projects stay in load order
+        self.settings.push_recent(&root.to_string_lossy());
+        if switch {
+            self.switch(self.projects.len() - 1);
+        }
+        self.persist();
+    }
+
+    fn switch(&mut self, i: usize) {
+        if i < self.projects.len() {
+            self.active = i;
+            let p = &mut self.projects[i];
+            p.attention = Attention::None;
+            p.chat.unseen = false;
+            p.chat.focus_input = true;
+            self.claude_open = true;
+            p.check_disk(&self.hl);
+            p.git.refresh_status();
+            self.persist();
+        }
+    }
+
+    fn persist(&mut self) {
+        self.settings.open_projects = self.projects.iter().map(|p| p.root.to_string_lossy().into_owned()).collect();
+        self.settings.active_project = self.active;
+        for p in &self.projects {
+            self.settings.memo.insert(memo_key(&p.root), p.memo());
+        }
+        self.settings.save();
+    }
+
+    fn show_view(&mut self, v: View) {
+        match v {
+            View::Files => self.left = Some(LeftTab::Project),
+            View::Git => {
+                self.left = Some(LeftTab::Commit);
+                self.bottom = Some(BottomTab::Git);
+                if let Some(p) = self.proj() {
+                    p.git.refresh_all();
+                }
+            }
+        }
+    }
+
+    fn proj(&mut self) -> Option<&mut Project> {
+        self.projects.get_mut(self.active)
+    }
+
+    fn open_file(&mut self, path: &Path, line: Option<usize>) {
+        let hl = &self.hl;
+        let Some(p) = self.projects.get_mut(self.active) else { return };
+        let idx = match p.docs.iter().position(|d| d.path == path) {
+            Some(i) => i,
+            None => {
+                if !path.is_file() {
+                    self.message = Some((format!("File not found: {}", path.display()), true));
+                    return;
+                }
+                p.docs.push(Doc::open(path, hl));
+                p.docs.len() - 1
+            }
+        };
+        p.active_doc = Some(idx);
+        p.tree.reveal(path);
+        if let Some(l) = line {
+            p.docs[idx].goto_line(l, 1);
+        } else {
+            let id = p.docs[idx].id;
+            let _ = id;
+        }
+    }
+
+    fn open_virtual(&mut self, title: String, key: String, text: String) {
+        let Some(p) = self.proj() else { return };
+        if let Some(i) = p.docs.iter().position(|d| d.path == PathBuf::from(format!("vibestorm://{key}"))) {
+            p.docs[i] = Doc::virtual_doc(&title, &key, text);
+            p.active_doc = Some(i);
+        } else {
+            p.docs.push(Doc::virtual_doc(&title, &key, text));
+            p.active_doc = Some(p.docs.len() - 1);
+        }
+    }
+
+    fn close_tab(&mut self, i: usize, force: bool) {
+        let Some(p) = self.projects.get_mut(self.active) else { return };
+        if i >= p.docs.len() {
+            return;
+        }
+        if p.docs[i].dirty && !force {
+            self.confirm = Some(Confirm::CloseTab(i));
+            return;
+        }
+        p.docs.remove(i);
+        p.active_doc = match p.active_doc {
+            _ if p.docs.is_empty() => None,
+            Some(a) if a > i => Some(a - 1),
+            Some(a) if a == i => Some(i.min(p.docs.len() - 1)),
+            other => other,
+        };
+        self.persist();
+    }
+
+    fn close_project(&mut self, i: usize, force: bool) {
+        if i >= self.projects.len() {
+            return;
+        }
+        if !force && (self.projects[i].dirty_count() > 0 || self.projects[i].chat.busy) {
+            self.confirm = Some(Confirm::CloseProject(i));
+            return;
+        }
+        let memo = self.projects[i].memo();
+        self.settings.memo.insert(memo_key(&self.projects[i].root), memo);
+        let root = self.projects[i].root.to_string_lossy().into_owned();
+        self.settings.push_recent(&root); // reappears in RECENT with a grey folder
+        self.projects.remove(i); // drops the Claude process
+        if self.active >= self.projects.len() {
+            self.active = self.projects.len().saturating_sub(1);
+        } else if self.active > i {
+            self.active -= 1;
+        }
+        self.persist();
+    }
+
+    fn save_all(&mut self) {
+        let mut errs = vec![];
+        if let Some(p) = self.projects.get_mut(self.active) {
+            for d in &mut p.docs {
+                if let Err(e) = d.save() {
+                    errs.push(e);
+                }
+            }
+            p.git.refresh_status();
+            p.last_active = util::unix_now();
+        }
+        if !errs.is_empty() {
+            self.message = Some((errs.join("; "), true));
+        }
+    }
+
+    fn notify(&mut self, ctx: &egui::Context, title: &str, body: &str, project_idx: usize, color: Color32) {
+        if !self.settings.notify {
+            return;
+        }
+        let Some(root) = self.projects.get(project_idx).map(|p| p.root.clone()) else { return };
+        // in-app card: always, so it's seen even while working in the IDE
+        self.toasts.retain(|t| t.root != root);
+        self.toasts.push(InAppToast { title: title.to_owned(), body: body.to_owned(), root: root.clone(), color, at: std::time::Instant::now() });
+        if self.toasts.len() > 4 {
+            self.toasts.remove(0);
+        }
+        let visible = self.focused && project_idx == self.active;
+        if self.settings.notify_only_unfocused && visible {
+            return;
+        }
+        // Windows toast; clicking it brings VibeStorm to the front on that project
+        let tx = self.toast_click_tx.clone();
+        let c = ctx.clone();
+        util::notify(
+            title,
+            body,
+            self.settings.notify_sound,
+            Some(Box::new(move || {
+                let _ = tx.send(root.clone());
+                c.request_repaint();
+            })),
+        );
+    }
+
+    /// Bottom-right notification cards. Click = go to the project.
+    fn toasts_ui(&mut self, ctx: &egui::Context, pal: &Palette) {
+        const LIFE: f32 = 9.0;
+        self.toasts.retain(|t| t.at.elapsed().as_secs_f32() < LIFE);
+        if self.toasts.is_empty() {
+            return;
+        }
+        let mut go: Option<PathBuf> = None;
+        let mut close: Option<usize> = None;
+        egui::Area::new(Id::new("inapp_toasts"))
+            .order(egui::Order::Foreground)
+            .anchor(Align2::RIGHT_BOTTOM, vec2(-14.0, -34.0))
+            .show(ctx, |ui| {
+                ui.set_max_width(360.0);
+                for (i, t) in self.toasts.iter().enumerate().rev() {
+                    let r = Frame::NONE
+                        .fill(pal.card)
+                        .stroke(Stroke::new(1.0, pal.border))
+                        .corner_radius(8)
+                        .shadow(egui::Shadow { offset: [0, 4], blur: 16, spread: 0, color: Color32::from_black_alpha(90) })
+                        .inner_margin(Margin { left: 12, right: 10, top: 9, bottom: 9 })
+                        .show(ui, |ui| {
+                            ui.set_width(330.0);
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("●").color(t.color));
+                                ui.add(egui::Label::new(RichText::new(&t.title).strong()).truncate());
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if ui.add(egui::Button::new(RichText::new("✕").small()).frame(false)).clicked() {
+                                        close = Some(i);
+                                    }
+                                });
+                            });
+                            if !t.body.is_empty() {
+                                ui.add(egui::Label::new(RichText::new(&t.body).small().color(pal.text_weak)).wrap());
+                            }
+                        });
+                    let resp = ui.interact(r.response.rect, Id::new(("toast_click", i)), Sense::click());
+                    if resp.hovered() {
+                        ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    if resp.clicked() && close.is_none() {
+                        go = Some(t.root.clone());
+                    }
+                    ui.add_space(6.0);
+                }
+            });
+        if let Some(i) = close {
+            self.toasts.remove(i);
+        }
+        if let Some(root) = go {
+            self.toasts.retain(|t| t.root != root);
+            if let Some(i) = self.projects.iter().position(|p| p.root == root) {
+                self.switch(i);
+            }
+        }
+        ctx.request_repaint_after(Duration::from_millis(500));
+    }
+
+    // ------------------------------------------------------------------ shortcuts
+
+    fn shortcuts(&mut self, ctx: &egui::Context) {
+        let mut sc = |m: Modifiers, k: Key| {
+            ctx.input_mut(|i| {
+                let hit = i.consume_shortcut(&KeyboardShortcut::new(m, k));
+                if hit {
+                    // Alt+digit etc. also produce a text event on Windows; swallow it.
+                    i.events.retain(|e| !matches!(e, egui::Event::Text(_)));
+                }
+                hit
+            })
+        };
+        let cs = Modifiers::COMMAND | Modifiers::SHIFT;
+        let ca = Modifiers::COMMAND | Modifiers::ALT;
+        if sc(cs, Key::N) {
+            self.quick = Some(QuickOpen { query: String::new(), results: vec![], computed: None, sel: 0, focus: true });
+        }
+        if sc(cs, Key::F) {
+            self.bottom = Some(BottomTab::Find);
+            if let Some(p) = self.projects.get_mut(self.active) {
+                p.find.focus = true;
+                // PhpStorm: the editor selection becomes the query
+                let sel = p.active_doc.and_then(|i| p.docs.get(i)).and_then(|d| d.selected_text(ctx));
+                if let Some(s) = sel {
+                    if s != p.find.query || !p.find.up_to_date() {
+                        p.find.query = s;
+                        p.find.start(p.root.clone(), ctx.clone());
+                    }
+                }
+            }
+        }
+        if sc(cs, Key::K) {
+            if let Some(p) = self.proj() {
+                p.git.push();
+            }
+        }
+        if sc(ca, Key::OpenBracket) && !self.projects.is_empty() {
+            let n = self.projects.len();
+            self.switch((self.active + n - 1) % n);
+        }
+        if sc(ca, Key::CloseBracket) && !self.projects.is_empty() {
+            let n = self.projects.len();
+            self.switch((self.active + 1) % n);
+        }
+        if sc(Modifiers::COMMAND, Key::S) {
+            self.save_all();
+        }
+        if sc(Modifiers::COMMAND, Key::F) {
+            if let Some(p) = self.proj() {
+                if let Some(d) = p.active_doc.and_then(|i| p.docs.get_mut(i)) {
+                    d.open_find();
+                }
+            }
+        }
+        if sc(Modifiers::COMMAND, Key::G) && self.proj().map(|p| p.active_doc.is_some()).unwrap_or(false) {
+            self.prompt = Some(Prompt { kind: PromptKind::GotoLine, value: String::new(), focus: true });
+        }
+        if sc(Modifiers::COMMAND, Key::W) || sc(Modifiers::COMMAND, Key::F4) {
+            if let Some(i) = self.proj().and_then(|p| p.active_doc) {
+                self.close_tab(i, false);
+            }
+        }
+        if sc(Modifiers::COMMAND, Key::Tab) {
+            if let Some(p) = self.proj() {
+                if !p.docs.is_empty() {
+                    p.active_doc = Some(p.active_doc.map(|a| (a + 1) % p.docs.len()).unwrap_or(0));
+                }
+            }
+        }
+        if sc(Modifiers::COMMAND, Key::K) {
+            self.left = Some(LeftTab::Commit);
+            if let Some(p) = self.proj() {
+                let id = Id::new(("commit_msg", p.root.clone()));
+                ctx.memory_mut(|m| m.request_focus(id));
+            }
+        }
+        if sc(Modifiers::COMMAND, Key::T) {
+            if let Some(p) = self.proj() {
+                p.git.pull();
+            }
+        }
+        if sc(Modifiers::ALT, Key::Num1) {
+            self.left = if self.left == Some(LeftTab::Project) { None } else { Some(LeftTab::Project) };
+        }
+        if sc(Modifiers::ALT, Key::Num0) {
+            self.left = if self.left == Some(LeftTab::Commit) { None } else { Some(LeftTab::Commit) };
+        }
+        if sc(Modifiers::ALT, Key::Num9) {
+            self.bottom = if self.bottom == Some(BottomTab::Git) { None } else { Some(BottomTab::Git) };
+        }
+        if sc(Modifiers::ALT, Key::Num2) {
+            self.claude_open = !self.claude_open;
+        }
+        if sc(Modifiers::COMMAND, Key::Equals) || sc(Modifiers::COMMAND, Key::Plus) {
+            self.settings.editor_font_size = (self.settings.editor_font_size + 1.0).min(32.0);
+        }
+        if sc(Modifiers::COMMAND, Key::Minus) {
+            self.settings.editor_font_size = (self.settings.editor_font_size - 1.0).max(8.0);
+        }
+        // Ctrl+Enter in commit message
+        if let Some(p) = self.projects.get_mut(self.active) {
+            let id = Id::new(("commit_msg", p.root.clone()));
+            if ctx.memory(|m| m.has_focus(id)) && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Enter)) {
+                p.git.commit(false);
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ panels
+
+    fn sidebar(&mut self, ui: &mut Ui, pal: &Palette, acts: &mut Vec<Action>) {
+        let collapsed = self.settings.sidebar_collapsed;
+        let now = ui.input(|i| i.time);
+        ui.add_space(6.0);
+        if collapsed {
+            ui.vertical_centered(|ui| {
+                if ui.small_button("»").on_hover_text("Expand sidebar").clicked() {
+                    self.settings.sidebar_collapsed = false;
+                    self.settings.save();
+                }
+                if ui.small_button("+").on_hover_text("Open project folder").clicked() {
+                    acts.push(Action::AddProjectDialog);
+                }
+            });
+        } else {
+            ui.horizontal(|ui| {
+                ui.add_space(4.0);
+                ui.label(RichText::new("PROJECTS").small().strong().color(pal.text_weak));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui.small_button("«").on_hover_text("Collapse sidebar").clicked() {
+                        self.settings.sidebar_collapsed = true;
+                        self.settings.save();
+                    }
+                    if ui.small_button("+").on_hover_text("Open project folder").clicked() {
+                        acts.push(Action::AddProjectDialog);
+                    }
+                });
+            });
+        }
+        ui.add_space(4.0);
+
+        // recent (closed) projects
+        let open: Vec<String> = self.projects.iter().map(|p| memo_key(&p.root)).collect();
+        let recent: Vec<String> = self
+            .settings
+            .recent
+            .iter()
+            .filter(|r| !open.contains(&r.to_lowercase()))
+            .cloned()
+            .collect();
+        let last_active = |r: &String| self.settings.memo.get(&r.to_lowercase()).map(|m| m.last_active).unwrap_or(0);
+        let mut recent = recent;
+        recent.sort_by_key(|r| std::cmp::Reverse(last_active(r))); // stable: unknown times keep list order
+        recent.truncate(if collapsed { 10 } else { 15 });
+
+        egui::ScrollArea::vertical().id_salt("projects_sb").auto_shrink([false, false]).show(ui, |ui| {
+            for (i, p) in self.projects.iter().enumerate() {
+                let approvals = p.chat.pending_approvals();
+                let pulse = 0.72 + 0.28 * ((now * 3.0).sin() as f32 * 0.5 + 0.5);
+                // folder colour = agent state
+                let (status, scol, fcol): (String, Color32, Color32) = if approvals > 0 {
+                    (format!("⚠ needs approval ({approvals})"), FOLDER_ALERT, FOLDER_ALERT)
+                } else if p.chat.busy {
+                    let secs = p.chat.busy_since.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+                    (format!("agent working {}", util::fmt_duration(secs)), FOLDER_WORKING, FOLDER_WORKING.gamma_multiply(pulse))
+                } else if p.attention == Attention::Done {
+                    ("✔ agent finished".into(), FOLDER_DONE, FOLDER_DONE)
+                } else if p.attention == Attention::Error {
+                    ("✖ agent stopped with error".into(), FOLDER_ALERT, FOLDER_ALERT)
+                } else {
+                    let ch = p.git.status.files.len();
+                    let b = if p.git.status.branch.is_empty() { "—".to_owned() } else { p.git.status.branch.clone() };
+                    (if ch > 0 { format!("⎇ {b} · {ch} changed") } else { format!("⎇ {b}") }, pal.text_weak, FOLDER_OPEN)
+                };
+                let row = ProjectRow {
+                    name: &p.name,
+                    path: &p.root,
+                    status: &status,
+                    status_color: scol,
+                    folder: fcol,
+                    lit: true,
+                    active: i == self.active,
+                    badge: if approvals > 0 { Some("!") } else { None },
+                    unload: true,
+                };
+                match project_row(ui, pal, collapsed, row, ("open", i)) {
+                    RowClick::Main => acts.push(Action::Switch(i)),
+                    RowClick::Files => acts.push(Action::SwitchView(i, View::Files)),
+                    RowClick::Git => acts.push(Action::SwitchView(i, View::Git)),
+                    RowClick::Unload => acts.push(Action::CloseProject(i)),
+                    RowClick::Menu(resp) => {
+                        resp.context_menu(|ui| {
+                            if ui.button("🗀  Project files").clicked() {
+                                acts.push(Action::SwitchView(i, View::Files));
+                                ui.close();
+                            }
+                            if ui.button("⎇  Git").clicked() {
+                                acts.push(Action::SwitchView(i, View::Git));
+                                ui.close();
+                            }
+                            ui.separator();
+                            if ui.button("⏏  Unload from memory (move to Recent)").clicked() {
+                                acts.push(Action::CloseProject(i));
+                                ui.close();
+                            }
+                            if ui.button("Reveal in Explorer").clicked() {
+                                acts.push(Action::Reveal(p.root.clone()));
+                                ui.close();
+                            }
+                            if ui.button("Open Terminal").clicked() {
+                                acts.push(Action::Terminal(p.root.clone()));
+                                ui.close();
+                            }
+                        });
+                    }
+                }
+            }
+
+            if !recent.is_empty() {
+                ui.add_space(8.0);
+                if collapsed {
+                    ui.separator();
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.add_space(4.0);
+                        ui.label(RichText::new("RECENT").small().strong().color(pal.text_weak));
+                    });
+                }
+                for (k, r) in recent.iter().enumerate() {
+                    let path = PathBuf::from(r);
+                    let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or(r.clone());
+                    let parent = path.parent().map(|p| p.display().to_string()).unwrap_or_default();
+                    let ts = last_active(r);
+                    let parent = if ts > 0 { format!("{} · {}", util::fmt_ago(ts), parent) } else { parent };
+                    let row = ProjectRow {
+                        name: &name,
+                        path: &path,
+                        status: &parent,
+                        status_color: pal.text_weak.gamma_multiply(0.8),
+                        folder: if self.settings.dark { FOLDER_GREY_DARK } else { FOLDER_GREY_LIGHT },
+                        lit: false,
+                        active: false,
+                        badge: None,
+                        unload: false,
+                    };
+                    match project_row(ui, pal, collapsed, row, ("recent", k)) {
+                        RowClick::Main | RowClick::Files => acts.push(Action::OpenProjectView(path.clone(), View::Files)),
+                        RowClick::Git => acts.push(Action::OpenProjectView(path.clone(), View::Git)),
+                        RowClick::Unload => {}
+                        RowClick::Menu(resp) => {
+                            resp.context_menu(|ui| {
+                                if ui.button("🗀  Open — project files").clicked() {
+                                    acts.push(Action::OpenProjectView(path.clone(), View::Files));
+                                    ui.close();
+                                }
+                                if ui.button("⎇  Open — git").clicked() {
+                                    acts.push(Action::OpenProjectView(path.clone(), View::Git));
+                                    ui.close();
+                                }
+                                if ui.button("Remove from Recent").clicked() {
+                                    acts.push(Action::ForgetRecent(r.clone()));
+                                    ui.close();
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    fn toolbar(&mut self, ui: &mut Ui, pal: &Palette, acts: &mut Vec<Action>) {
+        ui.horizontal_centered(|ui| {
+            ui.add_space(4.0);
+            ui.label(RichText::new("⚡").color(pal.warn).size(16.0));
+            let title = self.projects.get(self.active).map(|p| p.name.clone()).unwrap_or_else(|| "No project".into());
+            ui.menu_button(RichText::new(format!("{title} ▾")).strong(), |ui| {
+                if ui.button("Open Project Folder…").clicked() {
+                    acts.push(Action::AddProjectDialog);
+                    ui.close();
+                }
+                if !self.projects.is_empty() && ui.button("Close This Project").clicked() {
+                    acts.push(Action::CloseProject(self.active));
+                    ui.close();
+                }
+                ui.separator();
+                ui.label(RichText::new("Recent").small().color(pal.text_weak));
+                for r in self.settings.recent.iter().take(15) {
+                    if ui.button(r).clicked() {
+                        acts.push(Action::OpenProject(PathBuf::from(r)));
+                        ui.close();
+                    }
+                }
+            });
+            let Some(p) = self.projects.get_mut(self.active) else { return };
+            if p.git.status.is_repo {
+                let b = p.git.status.branch.clone();
+                ui.menu_button(format!("⎇ {b} ▾"), |ui| {
+                    if ui.button("+ New Branch…").clicked() {
+                        acts.push(Action::Prompt(PromptKind::NewBranch));
+                        ui.close();
+                    }
+                    ui.separator();
+                    ui.label(RichText::new("Local").small().color(pal.text_weak));
+                    egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                        for lb in p.git.local_branches.clone() {
+                            let cur = lb == b;
+                            if ui.selectable_label(cur, &lb).clicked() && !cur {
+                                p.git.checkout(&lb, false);
+                                ui.close();
+                            }
+                        }
+                        if !p.git.remote_branches.is_empty() {
+                            ui.separator();
+                            ui.label(RichText::new("Remote").small().color(pal.text_weak));
+                            for rb in p.git.remote_branches.clone() {
+                                if ui.button(&rb).clicked() {
+                                    p.git.checkout(&rb, true);
+                                    ui.close();
+                                }
+                            }
+                        }
+                    });
+                });
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.add_space(6.0);
+                if ui.button("⚙").on_hover_text("Settings").clicked() {
+                    self.show_settings = true;
+                }
+                if ui
+                    .button(if self.settings.dark { "☀" } else { "🌙" })
+                    .on_hover_text("Toggle light / dark theme")
+                    .clicked()
+                {
+                    self.settings.dark = !self.settings.dark;
+                    theme::apply(ui.ctx(), self.settings.dark, self.settings.ui_font_size);
+                    ui.ctx().send_viewport_cmd(ViewportCommand::SetTheme(if self.settings.dark { egui::SystemTheme::Dark } else { egui::SystemTheme::Light }));
+                    self.settings.save();
+                }
+                if ui.button(">_").on_hover_text("Open terminal in project").clicked() {
+                    acts.push(Action::Terminal(p.root.clone()));
+                }
+                ui.separator();
+                if p.git.status.is_repo {
+                    let push_lbl = if p.git.status.ahead > 0 { format!("⬆ Push ({})", p.git.status.ahead) } else { "⬆ Push".into() };
+                    if ui.button(push_lbl).on_hover_text("Push (Ctrl+Shift+K)").clicked() {
+                        p.git.push();
+                    }
+                    if ui.button("✔ Commit").on_hover_text("Commit (Ctrl+K)").clicked() {
+                        self.left = Some(LeftTab::Commit);
+                    }
+                    let pull_lbl = if p.git.status.behind > 0 { format!("⬇ Pull ({})", p.git.status.behind) } else { "⬇ Pull".into() };
+                    if ui.button(pull_lbl).on_hover_text("Update project (Ctrl+T)").clicked() {
+                        p.git.pull();
+                    }
+                    if ui.button("⟳").on_hover_text("Fetch").clicked() {
+                        p.git.fetch();
+                    }
+                }
+            });
+        });
+    }
+
+    fn stripe_button(ui: &mut Ui, pal: &Palette, icon: &str, tip: &str, on: bool) -> bool {
+        let (rect, resp) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::click());
+        if on {
+            ui.painter().rect_filled(rect, 6.0, pal.selection);
+        } else if resp.hovered() {
+            ui.painter().rect_filled(rect, 6.0, pal.hover);
+        }
+        ui.painter().text(rect.center(), Align2::CENTER_CENTER, icon, FontId::proportional(15.0), if on { pal.text } else { pal.text_weak });
+        resp.on_hover_text(tip).clicked()
+    }
+
+    fn status_bar(&mut self, ui: &mut Ui, pal: &Palette) {
+        let now = ui.input(|i| i.time);
+        ui.horizontal_centered(|ui| {
+            ui.spacing_mut().item_spacing.x = 14.0;
+            let Some(p) = self.projects.get_mut(self.active) else {
+                ui.label(RichText::new("VibeStorm").small().color(pal.text_weak));
+                return;
+            };
+            if !p.git.busy.is_empty() {
+                let spin = ["◐", "◓", "◑", "◒"][((now * 6.0) as usize) % 4];
+                ui.label(RichText::new(format!("{spin} {}…", p.git.busy.join(", "))).small().color(pal.accent));
+            } else if let Some(e) = p.git.last_error.clone() {
+                let r = ui.add(
+                    egui::Label::new(RichText::new(format!("✖ {}", util::truncate(e.lines().next().unwrap_or(""), 120))).small().color(pal.error))
+                        .sense(Sense::click()),
+                );
+                if r.on_hover_text(format!("{e}\n\n(click to dismiss)")).clicked() {
+                    p.git.last_error = None;
+                }
+            } else if let Some((m, err)) = self.message.clone() {
+                let r = ui.add(egui::Label::new(RichText::new(m).small().color(if err { pal.error } else { pal.text_weak })).sense(Sense::click()));
+                if r.clicked() {
+                    self.message = None;
+                }
+            } else if let Some(i) = &p.git.last_info {
+                ui.label(RichText::new(util::truncate(i, 120)).small().color(pal.text_weak));
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.add_space(8.0);
+                let c = &p.chat;
+                let (ct, cc) = if c.pending_approvals() > 0 {
+                    ("Claude: needs approval".to_owned(), pal.warn)
+                } else if c.busy {
+                    (format!("Claude: working {}", util::fmt_duration(c.busy_since.map(|t| t.elapsed().as_secs()).unwrap_or(0))), pal.accent)
+                } else {
+                    ("Claude: idle".to_owned(), pal.text_weak)
+                };
+                if ui.add(egui::Label::new(RichText::new(ct).small().color(cc)).sense(Sense::click())).clicked() {
+                    self.claude_open = true;
+                }
+                if p.git.status.is_repo {
+                    let s = &p.git.status;
+                    let mut t = format!("⎇ {}", s.branch);
+                    if s.ahead > 0 {
+                        t.push_str(&format!(" ↑{}", s.ahead));
+                    }
+                    if s.behind > 0 {
+                        t.push_str(&format!(" ↓{}", s.behind));
+                    }
+                    ui.label(RichText::new(t).small().color(pal.text_weak));
+                }
+                if let Some(d) = p.active_doc.and_then(|i| p.docs.get(i)) {
+                    if d.kind == editor::DocKind::Text {
+                        ui.label(RichText::new("UTF-8").small().color(pal.text_weak));
+                        ui.label(RichText::new(d.line_ending()).small().color(pal.text_weak));
+                        ui.label(RichText::new(format!("{}:{}", d.cursor.0, d.cursor.1)).small().color(pal.text_weak));
+                        if let Some(s) = &d.syntax {
+                            ui.label(RichText::new(s).small().color(pal.text_weak));
+                        }
+                    }
+                }
+            });
+        });
+    }
+
+    fn tabs_bar(&mut self, ui: &mut Ui, pal: &Palette, acts: &mut Vec<Action>) {
+        let Some(p) = self.projects.get_mut(self.active) else { return };
+        egui::ScrollArea::horizontal()
+            .id_salt("tabs")
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    for (i, d) in p.docs.iter().enumerate() {
+                        let active = p.active_doc == Some(i);
+                        let name_col = p
+                            .git
+                            .status_map
+                            .get(&util::rel_path(&p.root, &d.path))
+                            .map(|s| s.color(pal))
+                            .unwrap_or(pal.text);
+                        let font = FontId::proportional(13.0);
+                        let tw = ui.fonts_mut(|f| f.layout_no_wrap(d.title.clone(), font.clone(), name_col).size().x);
+                        let w = tw + 62.0;
+                        let (rect, resp) = ui.allocate_exact_size(vec2(w, 32.0), Sense::click());
+                        let painter = ui.painter();
+                        if active {
+                            painter.rect_filled(rect, 0.0, pal.editor_bg);
+                            painter.rect_filled(
+                                egui::Rect::from_min_max(pos2(rect.min.x, rect.max.y - 2.0), rect.max),
+                                0.0,
+                                pal.accent,
+                            );
+                        } else if resp.hovered() {
+                            painter.rect_filled(rect, 0.0, pal.hover);
+                        }
+                        let (badge, bcol) = if d.is_virtual() { ("Δ", pal.hunk) } else { file_badge(&d.title) };
+                        let br = egui::Rect::from_min_size(pos2(rect.min.x + 10.0, rect.center().y - 7.0), vec2(16.0, 14.0));
+                        painter.rect_filled(br, 3.0, bcol);
+                        painter.text(br.center(), Align2::CENTER_CENTER, badge, FontId::proportional(9.5), Color32::WHITE);
+                        painter.text(pos2(br.max.x + 6.0, rect.center().y), Align2::LEFT_CENTER, &d.title, font, name_col);
+                        let close_r = egui::Rect::from_center_size(pos2(rect.max.x - 14.0, rect.center().y), vec2(16.0, 16.0));
+                        let close_hover = ui.rect_contains_pointer(close_r);
+                        if d.dirty && !close_hover {
+                            painter.circle_filled(close_r.center(), 3.5, pal.text_weak);
+                        } else if resp.hovered() || active {
+                            if close_hover {
+                                painter.rect_filled(close_r, 3.0, pal.hover);
+                            }
+                            painter.text(close_r.center(), Align2::CENTER_CENTER, "×", FontId::proportional(14.0), pal.text_weak);
+                        }
+                        painter.line_segment([rect.right_top(), rect.right_bottom()], Stroke::new(1.0, pal.border.gamma_multiply(0.5)));
+                        let resp = resp.on_hover_text(d.path.display().to_string());
+                        if resp.clicked() {
+                            if close_hover {
+                                acts.push(Action::CloseTab(i));
+                            } else {
+                                p.active_doc = Some(i);
+                            }
+                        }
+                        if resp.middle_clicked() {
+                            acts.push(Action::CloseTab(i));
+                        }
+                        resp.context_menu(|ui| {
+                            if ui.button("Close").clicked() {
+                                acts.push(Action::CloseTab(i));
+                                ui.close();
+                            }
+                            if ui.button("Close Others").clicked() {
+                                acts.push(Action::CloseOthers(i));
+                                ui.close();
+                            }
+                            if !d.is_virtual() {
+                                if ui.button("Copy Path").clicked() {
+                                    acts.push(Action::Copy(d.path.display().to_string()));
+                                    ui.close();
+                                }
+                                if ui.button("Reveal in Explorer").clicked() {
+                                    acts.push(Action::Reveal(d.path.clone()));
+                                    ui.close();
+                                }
+                                if ui.button("🤖 Ask Claude about this file").clicked() {
+                                    acts.push(Action::AskClaude(util::rel_path(&p.root, &d.path)));
+                                    ui.close();
+                                }
+                            }
+                        });
+                    }
+                });
+            });
+    }
+
+    fn find_panel(&mut self, ui: &mut Ui, pal: &Palette, acts: &mut Vec<Action>) {
+        let ctx = ui.ctx().clone();
+        let Some(p) = self.projects.get_mut(self.active) else { return };
+        let root = p.root.clone();
+        let f = &mut p.find;
+        let id = Id::new(("fif", root.clone()));
+        let mut changed = false;
+        let mut run_now = false;
+        let mut open_sel = false;
+        let mut close = false;
+
+        ui.horizontal(|ui| {
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut f.query)
+                    .id(id)
+                    .hint_text("Find in project…   Enter: open  ·  ↑↓: navigate  ·  Esc: close")
+                    .desired_width(400.0),
+            );
+            if f.focus {
+                r.request_focus();
+                f.focus = false;
+            }
+            changed |= r.changed();
+            if r.has_focus() {
+                ui.input_mut(|i| {
+                    if i.consume_key(Modifiers::NONE, Key::ArrowDown) {
+                        f.step(1);
+                    }
+                    if i.consume_key(Modifiers::NONE, Key::ArrowUp) {
+                        f.step(-1);
+                    }
+                    if i.consume_key(Modifiers::NONE, Key::Escape) {
+                        close = true;
+                    }
+                });
+            }
+            if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                if f.up_to_date() && !f.rows.is_empty() && !f.running {
+                    open_sel = true;
+                } else {
+                    run_now = true;
+                    r.request_focus();
+                }
+            }
+            for (val, label, tip) in [
+                (&mut f.case, "Aa", "Match case"),
+                (&mut f.word, "W", "Whole words"),
+                (&mut f.regex, ".*", "Regular expression"),
+            ] {
+                if ui.selectable_label(*val, RichText::new(label).monospace().strong()).on_hover_text(tip).clicked() {
+                    *val = !*val;
+                    changed = true;
+                }
+            }
+            ui.add_space(6.0);
+            let m = ui.add(
+                egui::TextEdit::singleline(&mut f.mask)
+                    .hint_text("File mask: *.rs, *.ts, src/")
+                    .desired_width(170.0),
+            );
+            changed |= m.changed();
+            if m.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                run_now = true;
+            }
+            if ui.button("⟳").on_hover_text("Search again").clicked() {
+                run_now = true;
+            }
+            ui.add_space(6.0);
+            if let Some(e) = &f.error {
+                ui.label(RichText::new(format!("✖ {e}")).color(pal.error));
+            } else if f.running {
+                ui.label(RichText::new(format!("Searching…  {} matches", f.results.len())).color(pal.accent));
+            } else if let Some(q) = &f.searched {
+                let more = if f.truncated { " (showing first 5000)" } else { "" };
+                ui.label(
+                    RichText::new(format!(
+                        "{} matches in {} files for “{}”{more}  ·  {} files searched",
+                        f.results.len(),
+                        f.file_count(),
+                        util::truncate(q, 40),
+                        f.scanned
+                    ))
+                    .color(pal.text_weak),
+                );
+            }
+        });
+
+        // search as you type (debounced)
+        if changed {
+            f.dirty_at = Some(std::time::Instant::now());
+        }
+        if let Some(t) = f.dirty_at {
+            let wait = Duration::from_millis(280).saturating_sub(t.elapsed());
+            if wait.is_zero() {
+                run_now = true;
+            } else {
+                ctx.request_repaint_after(wait);
+            }
+        }
+        if run_now {
+            f.start(root.clone(), ctx.clone());
+        }
+        if open_sel {
+            if let Some(h) = f.selected_hit() {
+                acts.push(Action::OpenFileAt { path: root.join(&h.path), line: h.line, col: h.col, len: h.len });
+            }
+        }
+
+        ui.separator();
+        if f.rows.is_empty() {
+            let hint = if f.running {
+                "Searching…"
+            } else if f.searched.is_some() {
+                "Nothing found."
+            } else {
+                "Type to search in all project files (node_modules, target, .git… are skipped).\nAa = match case · W = whole words · .* = regex · mask limits files, e.g. *.php, src/"
+            };
+            ui.add_space(6.0);
+            ui.label(RichText::new(hint).color(pal.text_weak));
+        }
+
+        let row_h = 20.0;
+        let step = row_h + ui.spacing().item_spacing.y;
+        let mut sa = egui::ScrollArea::vertical().id_salt(("fif_results", root.clone())).auto_shrink([false, false]);
+        if f.scroll_to_sel {
+            if let Some(s) = f.sel {
+                let view = ui.available_height();
+                sa = sa.vertical_scroll_offset((s as f32 * step - view / 2.0).max(0.0));
+            }
+            f.scroll_to_sel = false;
+        }
+        let mut clicked: Option<usize> = None;
+        let mono = FontId::monospace(12.5);
+        sa.show_rows(ui, row_h, f.rows.len(), |ui, range| {
+            for ri in range {
+                let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click());
+                let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+                match &f.rows[ri] {
+                    search::Row::File { path, count } => {
+                        if resp.hovered() {
+                            painter.rect_filled(rect, 3.0, pal.hover);
+                        }
+                        let (dir, name) = match path.rfind('/') {
+                            Some(i) => (&path[..i], &path[i + 1..]),
+                            None => ("", path.as_str()),
+                        };
+                        let (badge, bcol) = file_badge(name);
+                        let mut x = rect.min.x + 6.0;
+                        let bg = painter.layout_no_wrap(badge.to_owned(), FontId::proportional(10.0), bcol);
+                        painter.galley(pos2(x, rect.center().y - bg.size().y / 2.0), bg.clone(), bcol);
+                        x += bg.size().x.max(12.0) + 6.0;
+                        let ng = painter.layout_no_wrap(name.to_owned(), FontId::proportional(13.0), pal.text);
+                        painter.galley(pos2(x, rect.center().y - ng.size().y / 2.0), ng.clone(), pal.text);
+                        x += ng.size().x + 10.0;
+                        let info = if dir.is_empty() { format!("{count}") } else { format!("{dir}   {count}") };
+                        painter.text(pos2(x, rect.center().y), Align2::LEFT_CENTER, info, FontId::proportional(12.0), pal.text_weak);
+                        if resp.clicked() {
+                            acts.push(Action::OpenFile(root.join(path), None));
+                        }
+                    }
+                    search::Row::Hit(hi) => {
+                        let h = &f.results[*hi];
+                        if f.sel == Some(ri) {
+                            painter.rect_filled(rect, 3.0, pal.selection);
+                        } else if resp.hovered() {
+                            painter.rect_filled(rect, 3.0, pal.hover);
+                        }
+                        let num_right = rect.min.x + 70.0;
+                        painter.text(
+                            pos2(num_right, rect.center().y),
+                            Align2::RIGHT_CENTER,
+                            h.line.to_string(),
+                            mono.clone(),
+                            pal.gutter_text,
+                        );
+                        let normal = egui::TextFormat { font_id: mono.clone(), color: pal.text, ..Default::default() };
+                        let hl = egui::TextFormat {
+                            font_id: mono.clone(),
+                            color: pal.text,
+                            background: pal.find_match,
+                            ..Default::default()
+                        };
+                        let mut job = egui::text::LayoutJob::default();
+                        let mut pos = 0;
+                        for &(a, b) in &h.ranges {
+                            if a < pos || b > h.text.len() || !h.text.is_char_boundary(a) || !h.text.is_char_boundary(b) {
+                                continue;
+                            }
+                            job.append(&h.text[pos..a], 0.0, normal.clone());
+                            job.append(&h.text[a..b], 0.0, hl.clone());
+                            pos = b;
+                        }
+                        job.append(&h.text[pos..], 0.0, normal);
+                        let g = painter.layout_job(job);
+                        painter.galley(pos2(num_right + 12.0, rect.center().y - g.size().y / 2.0), g, pal.text);
+                        if resp.clicked() {
+                            clicked = Some(ri);
+                        }
+                    }
+                }
+            }
+        });
+        if let Some(ri) = clicked {
+            f.sel = Some(ri);
+            if let search::Row::Hit(hi) = f.rows[ri] {
+                let h = &f.results[hi];
+                acts.push(Action::OpenFileAt { path: root.join(&h.path), line: h.line, col: h.col, len: h.len });
+            }
+        }
+        if close {
+            self.bottom = None;
+        }
+    }
+
+    fn welcome(&mut self, ui: &mut Ui, pal: &Palette, acts: &mut Vec<Action>) {
+        ui.vertical_centered(|ui| {
+            ui.add_space(ui.available_height() * 0.22);
+            ui.label(RichText::new("⚡ VibeStorm").size(30.0).color(pal.accent).strong());
+            ui.label(RichText::new("Fast native editor with git and parallel Claude Code agents").color(pal.text_weak));
+            ui.add_space(18.0);
+            if ui.add(egui::Button::new(RichText::new("  Open Project Folder…  ").color(Color32::WHITE).size(15.0)).fill(pal.accent)).clicked() {
+                acts.push(Action::AddProjectDialog);
+            }
+            ui.add_space(8.0);
+            ui.label(RichText::new("…or drop a folder onto this window").small().color(pal.text_weak));
+            ui.add_space(18.0);
+            for r in self.settings.recent.iter().take(10) {
+                if ui.link(r).clicked() {
+                    acts.push(Action::OpenProject(PathBuf::from(r)));
+                }
+            }
+        });
+    }
+
+    fn modals(&mut self, ctx: &egui::Context, pal: &Palette) {
+        // ---- prompt
+        if let Some(pr) = &mut self.prompt {
+            let title = match &pr.kind {
+                PromptKind::NewFile(_) => "New File",
+                PromptKind::NewFolder(_) => "New Folder",
+                PromptKind::Rename(_) => "Rename",
+                PromptKind::GotoLine => "Go to Line[:Column]",
+                PromptKind::NewBranch => "New Branch",
+            };
+            let mut done = None;
+            let resp = egui::Modal::new(Id::new("prompt")).show(ctx, |ui| {
+                ui.set_width(380.0);
+                ui.label(RichText::new(title).strong());
+                let r = ui.add(egui::TextEdit::singleline(&mut pr.value).desired_width(f32::INFINITY));
+                if pr.focus {
+                    r.request_focus();
+                    pr.focus = false;
+                }
+                if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                    done = Some(true);
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("OK").clicked() {
+                        done = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        done = Some(false);
+                    }
+                });
+            });
+            if resp.should_close() && done.is_none() {
+                done = Some(false);
+            }
+            if let Some(ok) = done {
+                let pr = self.prompt.take().unwrap();
+                if ok && !pr.value.trim().is_empty() {
+                    self.apply_prompt(pr);
+                }
+            }
+        }
+        // ---- confirm
+        if let Some(c) = &self.confirm {
+            let (title, body, ok_label): (String, String, &str) = match c {
+                Confirm::Delete(p) => ("Delete".into(), format!("Delete {}?\nThis cannot be undone.", p.display()), "Delete"),
+                Confirm::Rollback(f) => ("Rollback changes".into(), format!("Discard local changes in {} file(s)?\nUntracked files will be deleted.", f.len()), "Rollback"),
+                Confirm::CloseTab(i) => {
+                    let name = self.projects.get(self.active).and_then(|p| p.docs.get(*i)).map(|d| d.title.clone()).unwrap_or_default();
+                    ("Unsaved changes".into(), format!("Save changes to {name}?"), "Save")
+                }
+                Confirm::CloseProject(i) => {
+                    let p = &self.projects[*i];
+                    ("Close project".into(), format!("Close {}?{}{}", p.name, if p.dirty_count() > 0 { format!("\n{} unsaved file(s) will be lost.", p.dirty_count()) } else { String::new() }, if p.chat.busy { "\nIts running Claude task will be stopped." } else { "" }), "Close")
+                }
+                Confirm::Exit => {
+                    let dirty: usize = self.projects.iter().map(|p| p.dirty_count()).sum();
+                    let busy = self.projects.iter().filter(|p| p.chat.busy).count();
+                    ("Exit VibeStorm".into(), format!("{}{}", if dirty > 0 { format!("{dirty} unsaved file(s).\n") } else { String::new() }, if busy > 0 { format!("{busy} Claude task(s) still running.") } else { String::new() }), "Save all & exit")
+                }
+            };
+            let mut res: Option<u8> = None; // 1 = ok, 2 = alt, 0 = cancel
+            let is_tab = matches!(c, Confirm::CloseTab(_));
+            let is_exit = matches!(c, Confirm::Exit);
+            let r = egui::Modal::new(Id::new("confirm")).show(ctx, |ui| {
+                ui.set_width(400.0);
+                ui.label(RichText::new(title).strong());
+                ui.add_space(4.0);
+                ui.label(body);
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let danger = matches!(self.confirm, Some(Confirm::Delete(_)) | Some(Confirm::Rollback(_)));
+                    if ui.add(egui::Button::new(RichText::new(ok_label).color(Color32::WHITE)).fill(if danger { pal.error } else { pal.accent })).clicked() {
+                        res = Some(1);
+                    }
+                    if (is_tab || is_exit) && ui.button(if is_tab { "Don't Save" } else { "Exit without saving" }).clicked() {
+                        res = Some(2);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        res = Some(0);
+                    }
+                });
+            });
+            if r.should_close() && res.is_none() {
+                res = Some(0);
+            }
+            if let Some(v) = res {
+                let c = self.confirm.take().unwrap();
+                if v > 0 {
+                    self.apply_confirm(c, v == 1, ctx);
+                }
+            }
+        }
+        // ---- quick open
+        let mut open_rel: Option<String> = None;
+        let mut close_quick = false;
+        if let (Some(q), Some(p)) = (&mut self.quick, self.projects.get(self.active)) {
+            let files = p.index.files.lock().unwrap();
+            if q.computed.as_deref() != Some(q.query.as_str()) {
+                q.results = search::quick_matches(&files, &q.query, 40);
+                q.computed = Some(q.query.clone());
+                q.sel = 0;
+            }
+            drop(files);
+            let r = egui::Modal::new(Id::new("quick")).show(ctx, |ui| {
+                ui.set_width(560.0);
+                ui.label(RichText::new("Go to File").strong());
+                let input_id = Id::new("quick_input");
+                if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowDown)) {
+                    q.sel = (q.sel + 1).min(q.results.len().saturating_sub(1));
+                }
+                if ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowUp)) {
+                    q.sel = q.sel.saturating_sub(1);
+                }
+                let enter = ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter));
+                let te = ui.add(egui::TextEdit::singleline(&mut q.query).id(input_id).hint_text("Type a file name…").desired_width(f32::INFINITY));
+                if q.focus {
+                    te.request_focus();
+                    q.focus = false;
+                }
+                if enter {
+                    open_rel = q.results.get(q.sel).cloned();
+                }
+                egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+                    for (i, f) in q.results.iter().enumerate() {
+                        let (dir, name) = match f.rfind('/') {
+                            Some(k) => (&f[..k], &f[k + 1..]),
+                            None => ("", f.as_str()),
+                        };
+                        let resp = ui.add(egui::Button::selectable(
+                            i == q.sel,
+                            RichText::new(format!("{name}   ")).color(pal.text),
+                        ).right_text(RichText::new(dir).small().color(pal.text_weak)));
+                        if i == q.sel {
+                            resp.scroll_to_me(None);
+                        }
+                        if resp.clicked() {
+                            open_rel = Some(f.clone());
+                        }
+                    }
+                    if !*p.index.ready.lock().unwrap() {
+                        ui.label(RichText::new("Indexing…").small().color(pal.text_weak));
+                    }
+                });
+            });
+            if r.should_close() {
+                close_quick = true;
+            }
+        }
+        if let Some(rel) = open_rel {
+            self.quick = None;
+            if let Some(root) = self.projects.get(self.active).map(|p| p.root.clone()) {
+                self.open_file(&root.join(rel), None);
+            }
+        } else if close_quick {
+            self.quick = None;
+        }
+        // ---- settings
+        if self.show_settings {
+            let mut close = false;
+            let mut retheme = false;
+            let r = egui::Modal::new(Id::new("settings")).show(ctx, |ui| {
+                ui.set_width(420.0);
+                ui.heading("Settings");
+                ui.add_space(6.0);
+                egui::Grid::new("settings_grid").num_columns(2).spacing([16.0, 8.0]).show(ui, |ui| {
+                    ui.label("Theme");
+                    ui.horizontal(|ui| {
+                        if ui.selectable_label(self.settings.dark, "🌙 Dark").clicked() {
+                            self.settings.dark = true;
+                            retheme = true;
+                        }
+                        if ui.selectable_label(!self.settings.dark, "☀ Light").clicked() {
+                            self.settings.dark = false;
+                            retheme = true;
+                        }
+                    });
+                    ui.end_row();
+                    ui.label("Editor font size");
+                    ui.add(egui::Slider::new(&mut self.settings.editor_font_size, 9.0..=28.0).step_by(0.5));
+                    ui.end_row();
+                    ui.label("UI font size");
+                    if ui.add(egui::Slider::new(&mut self.settings.ui_font_size, 11.0..=18.0).step_by(0.5)).drag_stopped() {
+                        retheme = true;
+                    }
+                    ui.end_row();
+                    ui.label("Notifications");
+                    ui.vertical(|ui| {
+                        ui.checkbox(&mut self.settings.notify, "Notify when Claude finishes / needs approval");
+                        ui.checkbox(&mut self.settings.notify_only_unfocused, "Only when I'm not looking at that project");
+                        ui.checkbox(&mut self.settings.notify_sound, "Play sound");
+                        if ui.button("Send test notification").clicked() {
+                            util::notify("VibeStorm", "Notifications are working ✔", self.settings.notify_sound, None);
+                        }
+                    });
+                    ui.end_row();
+                    ui.label("New chats: model");
+                    egui::ComboBox::from_id_salt("def_model")
+                        .selected_text(MODELS.iter().find(|m| m.0 == self.settings.claude_model).map(|m| m.1).unwrap_or("Default"))
+                        .show_ui(ui, |ui| {
+                            for (id, l) in MODELS {
+                                ui.selectable_value(&mut self.settings.claude_model, id.to_string(), *l);
+                            }
+                        });
+                    ui.end_row();
+                    ui.label("New chats: permissions");
+                    egui::ComboBox::from_id_salt("def_mode")
+                        .selected_text(MODES.iter().find(|m| m.0 == self.settings.claude_mode).map(|m| m.1).unwrap_or("Ask"))
+                        .show_ui(ui, |ui| {
+                            for (id, l, tip) in MODES {
+                                ui.selectable_value(&mut self.settings.claude_mode, id.to_string(), *l).on_hover_text(*tip);
+                            }
+                        });
+                    ui.end_row();
+                });
+                ui.add_space(8.0);
+                ui.label(RichText::new("Shortcuts: Ctrl+Shift+N go to file · Ctrl+Shift+F find in files · Ctrl+F find · Ctrl+G go to line · Ctrl+S save all · Ctrl+K commit · Ctrl+Shift+K push · Ctrl+T pull · Alt+1 project · Alt+0 commit · Alt+9 git log · Alt+2 Claude · Ctrl+Alt+[ / ] switch project · Ctrl+± font size").small().color(pal.text_weak));
+                ui.add_space(8.0);
+                if ui.button("Close").clicked() {
+                    close = true;
+                }
+            });
+            if retheme {
+                theme::apply(ctx, self.settings.dark, self.settings.ui_font_size);
+                ctx.send_viewport_cmd(ViewportCommand::SetTheme(if self.settings.dark { egui::SystemTheme::Dark } else { egui::SystemTheme::Light }));
+            }
+            if close || r.should_close() {
+                self.show_settings = false;
+                self.settings.save();
+            }
+        }
+    }
+
+    fn apply_prompt(&mut self, pr: Prompt) {
+        let v = pr.value.trim().to_owned();
+        match pr.kind {
+            PromptKind::NewFile(dir) => {
+                let path = dir.join(&v);
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+                    Ok(_) => {
+                        if let Some(p) = self.proj() {
+                            p.tree.refresh();
+                            p.git.refresh_status();
+                        }
+                        self.open_file(&path, None);
+                    }
+                    Err(e) => self.message = Some((format!("Cannot create file: {e}"), true)),
+                }
+            }
+            PromptKind::NewFolder(dir) => match std::fs::create_dir_all(dir.join(&v)) {
+                Ok(_) => {
+                    if let Some(p) = self.proj() {
+                        p.tree.refresh();
+                    }
+                }
+                Err(e) => self.message = Some((format!("Cannot create folder: {e}"), true)),
+            },
+            PromptKind::Rename(path) => {
+                let new = path.parent().map(|d| d.join(&v)).unwrap_or_else(|| PathBuf::from(&v));
+                match std::fs::rename(&path, &new) {
+                    Ok(_) => {
+                        let hl = &self.hl;
+                        if let Some(p) = self.projects.get_mut(self.active) {
+                            for d in &mut p.docs {
+                                if d.path.starts_with(&path) {
+                                    let rest = d.path.strip_prefix(&path).unwrap().to_path_buf();
+                                    let np = if rest.as_os_str().is_empty() { new.clone() } else { new.join(rest) };
+                                    *d = Doc::open(&np, hl);
+                                }
+                            }
+                            p.tree.refresh();
+                            p.git.refresh_status();
+                        }
+                    }
+                    Err(e) => self.message = Some((format!("Rename failed: {e}"), true)),
+                }
+            }
+            PromptKind::GotoLine => {
+                let mut it = v.split(':');
+                let line = it.next().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(1);
+                let col = it.next().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(1);
+                if let Some(p) = self.proj() {
+                    if let Some(d) = p.active_doc.and_then(|i| p.docs.get_mut(i)) {
+                        d.goto_line(line, col);
+                    }
+                }
+            }
+            PromptKind::NewBranch => {
+                if let Some(p) = self.proj() {
+                    p.git.new_branch(&v);
+                }
+            }
+        }
+    }
+
+    fn apply_confirm(&mut self, c: Confirm, primary: bool, ctx: &egui::Context) {
+        match c {
+            Confirm::Delete(path) => {
+                let r = if path.is_dir() { std::fs::remove_dir_all(&path) } else { std::fs::remove_file(&path) };
+                if let Err(e) = r {
+                    self.message = Some((format!("Delete failed: {e}"), true));
+                }
+                if let Some(p) = self.proj() {
+                    let to_close: Vec<usize> = p.docs.iter().enumerate().filter(|(_, d)| d.path.starts_with(&path)).map(|(i, _)| i).collect();
+                    for i in to_close.into_iter().rev() {
+                        p.docs.remove(i);
+                    }
+                    p.active_doc = if p.docs.is_empty() { None } else { Some(p.docs.len() - 1) };
+                    p.tree.refresh();
+                    p.git.refresh_status();
+                }
+            }
+            Confirm::Rollback(files) => {
+                if let Some(p) = self.proj() {
+                    p.git.rollback(files);
+                }
+            }
+            Confirm::CloseTab(i) => {
+                if primary {
+                    if let Some(p) = self.proj() {
+                        if let Some(d) = p.docs.get_mut(i) {
+                            if let Err(e) = d.save() {
+                                self.message = Some((e, true));
+                                return;
+                            }
+                        }
+                    }
+                }
+                self.close_tab(i, true);
+            }
+            Confirm::CloseProject(i) => self.close_project(i, true),
+            Confirm::Exit => {
+                if primary {
+                    for p in &mut self.projects {
+                        for d in &mut p.docs {
+                            let _ = d.save();
+                        }
+                    }
+                }
+                self.allow_close = true;
+                ctx.send_viewport_cmd(ViewportCommand::Close);
+            }
+        }
+    }
+
+    fn apply(&mut self, acts: Vec<Action>, ctx: &egui::Context) {
+        for a in acts {
+            match a {
+                Action::OpenFile(p, line) => self.open_file(&p, line),
+                Action::OpenFileAt { path, line, col, len } => {
+                    self.open_file(&path, None);
+                    if let Some(p) = self.projects.get_mut(self.active) {
+                        if let Some(d) = p.active_doc.and_then(|i| p.docs.get_mut(i)) {
+                            if d.path == path {
+                                d.select_at(line, col, len);
+                            }
+                        }
+                    }
+                }
+                Action::OpenDiff { title, key, text } => self.open_virtual(title, key, text),
+                Action::Switch(i) => self.switch(i),
+                Action::SwitchView(i, v) => {
+                    self.switch(i);
+                    self.show_view(v);
+                }
+                Action::OpenProjectView(p, v) => {
+                    if p.is_dir() {
+                        self.add_project(p, ctx, true);
+                        self.show_view(v);
+                    } else {
+                        self.message = Some((format!("Folder not found: {}", p.display()), true));
+                        self.settings.recent.retain(|r| PathBuf::from(r) != p);
+                        self.settings.save();
+                    }
+                }
+                Action::ForgetRecent(r) => {
+                    self.settings.recent.retain(|x| x != &r);
+                    self.settings.save();
+                }
+                Action::AddProjectDialog => {
+                    if let Some(dir) = rfd::FileDialog::new().set_title("Open project folder").pick_folder() {
+                        self.add_project(dir, ctx, true);
+                    }
+                }
+                Action::OpenProject(p) => {
+                    if p.is_dir() {
+                        self.add_project(p, ctx, true);
+                    } else {
+                        self.message = Some((format!("Folder not found: {}", p.display()), true));
+                        self.settings.recent.retain(|r| PathBuf::from(r) != p);
+                    }
+                }
+                Action::CloseProject(i) => self.close_project(i, false),
+                Action::CloseTab(i) => self.close_tab(i, false),
+                Action::CloseOthers(i) => {
+                    if let Some(p) = self.proj() {
+                        let keep = p.docs.remove(i);
+                        let dirty: Vec<Doc> = p.docs.drain(..).filter(|d| d.dirty).collect();
+                        p.docs = dirty;
+                        p.docs.insert(0, keep);
+                        p.active_doc = Some(0);
+                    }
+                }
+                Action::Prompt(kind) => {
+                    let value = match &kind {
+                        PromptKind::Rename(p) => p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+                        _ => String::new(),
+                    };
+                    self.prompt = Some(Prompt { kind, value, focus: true });
+                }
+                Action::Confirm(c) => self.confirm = Some(c),
+                Action::Terminal(p) => util::open_terminal(&p),
+                Action::Reveal(p) => util::reveal_in_explorer(&p),
+                Action::Copy(s) => ctx.copy_text(s),
+                Action::AskClaude(rel) => {
+                    self.claude_open = true;
+                    if let Some(p) = self.proj() {
+                        if !p.chat.input.is_empty() && !p.chat.input.ends_with(' ') {
+                            p.chat.input.push(' ');
+                        }
+                        p.chat.input.push_str(&format!("@{rel} "));
+                        let id = Id::new(("claude_input", p.root.clone()));
+                        ctx.memory_mut(|m| m.request_focus(id));
+                    }
+                }
+                Action::SaveAll => self.save_all(),
+            }
+        }
+    }
+}
+
+
+// ---------------------------------------------------------------- sidebar rows
+
+const FOLDER_OPEN: Color32 = theme::hex(0x3D8BFF); // open project, agent idle: blue
+const FOLDER_WORKING: Color32 = theme::hex(0xE8B04B); // agent working: amber (pulsing)
+const FOLDER_DONE: Color32 = theme::hex(0x4CC38A); // agent finished: green
+const FOLDER_ALERT: Color32 = theme::hex(0xF0524F); // agent asks a question / approval, or error: red
+const FOLDER_GREY_DARK: Color32 = theme::hex(0x5C6068);
+const FOLDER_GREY_LIGHT: Color32 = theme::hex(0xB4B8C0);
+
+#[derive(Clone, Copy, PartialEq)]
+enum View {
+    Files,
+    Git,
+}
+
+struct ProjectRow<'a> {
+    name: &'a str,
+    path: &'a Path,
+    status: &'a str,
+    status_color: Color32,
+    folder: Color32,
+    lit: bool,
+    active: bool,
+    badge: Option<&'static str>,
+    /// show the ⏏ "unload from memory" quick button
+    unload: bool,
+}
+
+enum RowClick {
+    Main,
+    Files,
+    Git,
+    Unload,
+    Menu(egui::Response),
+}
+
+/// Paint a folder glyph centred in `r`. Lit = bright front flap.
+fn paint_folder(p: &egui::Painter, r: egui::Rect, color: Color32, lit: bool) {
+    let w = r.width();
+    let h = w * 0.74;
+    let body = egui::Rect::from_center_size(r.center() + vec2(0.0, w * 0.05), vec2(w, h));
+    let tab = egui::Rect::from_min_size(body.min - vec2(0.0, w * 0.13), vec2(w * 0.44, w * 0.22));
+    let flap = egui::Rect::from_min_max(body.min + vec2(0.0, h * 0.24), body.max);
+    let (back, front) = if lit { (0.78, 1.0) } else { (0.7, 0.85) };
+    p.rect_filled(tab, 2.5, color.gamma_multiply(back));
+    p.rect_filled(body, 3.0, color.gamma_multiply(back));
+    p.rect_filled(flap, 3.0, color.gamma_multiply(front));
+}
+
+fn project_row(ui: &mut Ui, pal: &Palette, collapsed: bool, row: ProjectRow, salt: (&str, usize)) -> RowClick {
+    let h = if collapsed { 40.0 } else { 44.0 };
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::click());
+    let painter = ui.painter().clone();
+    let hovered = ui.rect_contains_pointer(rect);
+    if row.active {
+        painter.rect_filled(rect.shrink2(vec2(3.0, 1.0)), 6.0, pal.selection.gamma_multiply(0.75));
+        painter.rect_filled(
+            egui::Rect::from_min_size(pos2(rect.min.x, rect.min.y + 8.0), vec2(3.0, h - 16.0)),
+            2.0,
+            pal.accent,
+        );
+    } else if hovered {
+        painter.rect_filled(rect.shrink2(vec2(3.0, 1.0)), 6.0, pal.hover);
+    }
+    let icon_size = if collapsed { 24.0 } else { 26.0 };
+    let icon_x = if collapsed { rect.center().x } else { rect.min.x + 12.0 + icon_size / 2.0 };
+    let icon = egui::Rect::from_center_size(pos2(icon_x, rect.center().y), vec2(icon_size, icon_size));
+    paint_folder(&painter, icon, row.folder, row.lit);
+    if let Some(b) = row.badge {
+        let c = pos2(icon.max.x - 1.0, icon.min.y + 3.0);
+        painter.circle_filled(c, 6.0, pal.sidebar_bg);
+        painter.circle_filled(c, 5.0, FOLDER_ALERT);
+        painter.text(c, Align2::CENTER_CENTER, b, FontId::proportional(9.0), Color32::WHITE);
+    }
+
+    let mut sub: Option<RowClick> = None;
+    if !collapsed {
+        let x = icon.max.x + 10.0;
+        let btn = 22.0;
+        let mut buttons: Vec<(&str, &str, RowClick)> =
+            vec![("🗀", "Project files", RowClick::Files), ("⎇", "Git", RowClick::Git)];
+        if row.unload {
+            buttons.push(("⏏", "Unload from memory: stop the agent, close tabs, move to Recent", RowClick::Unload));
+        }
+        let nb = buttons.len() as f32;
+        let text_right = if hovered { rect.max.x - nb * (btn + 2.0) - 10.0 } else { rect.max.x - 6.0 };
+        let clip = egui::Rect::from_min_max(pos2(x, rect.min.y), pos2(text_right, rect.max.y));
+        let pc = painter.with_clip_rect(clip);
+        let name_col = if row.lit { pal.text } else { pal.text_weak };
+        pc.text(pos2(x, rect.center().y - 8.0), Align2::LEFT_CENTER, row.name, FontId::proportional(13.5), name_col);
+        pc.text(pos2(x, rect.center().y + 9.0), Align2::LEFT_CENTER, row.status, FontId::proportional(11.0), row.status_color);
+        // quick buttons: project files / git (appear on hover)
+        if hovered {
+            let last = buttons.len() - 1;
+            for (k, (glyph, tip, click)) in buttons.into_iter().enumerate() {
+                let cx = rect.max.x - 8.0 - btn / 2.0 - (last - k) as f32 * (btn + 2.0);
+                let r = egui::Rect::from_center_size(pos2(cx, rect.center().y), vec2(btn, btn));
+                let br = ui.interact(r, Id::new(("sb_btn", salt.0, salt.1, k)), Sense::click());
+                painter.rect_filled(r, 5.0, if br.hovered() { pal.button_bg } else { pal.hover });
+                painter.text(r.center(), Align2::CENTER_CENTER, glyph, FontId::proportional(13.0), pal.text);
+                if br.on_hover_text(tip).clicked() {
+                    sub = Some(click);
+                }
+            }
+        }
+    }
+    if let Some(s) = sub {
+        return s;
+    }
+    let resp = resp.on_hover_text(format!("{}\n{}\n\nClick: open · right-click: more", row.path.display(), row.status));
+    if resp.clicked() {
+        return RowClick::Main;
+    }
+    RowClick::Menu(resp)
+}
+
+impl eframe::App for IdeApp {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let mut notes: Vec<(String, String, usize, Color32)> = vec![];
+        let mut attention = false;
+        for (i, p) in self.projects.iter_mut().enumerate() {
+            let mut touched = false;
+            for s in p.chat.poll() {
+                match s {
+                    Signal::Done { summary, is_error } => {
+                        p.attention = if is_error { Attention::Error } else { Attention::Done };
+                        let t = if is_error { format!("✖ {} — Claude stopped", p.name) } else { format!("✔ {} — Claude finished", p.name) };
+                        notes.push((t, util::truncate(&summary, 180), i, if is_error { FOLDER_ALERT } else { FOLDER_DONE }));
+                        touched = true;
+                        attention = true;
+                    }
+                    Signal::NeedsApproval { tool } => {
+                        notes.push((format!("⚠ {} — Claude needs you", p.name), format!("Allow {tool}?"), i, FOLDER_ALERT));
+                        attention = true;
+                    }
+                    Signal::FilesTouched => touched = true,
+                }
+            }
+            if p.git.poll() {
+                touched = true;
+            }
+            if touched {
+                p.check_disk(&self.hl);
+                p.tree.refresh();
+                p.git.refresh_status();
+            }
+            p.find.poll();
+            if touched || p.chat.busy {
+                p.last_active = util::unix_now();
+            }
+            if p.chat.busy {
+                p.attention = Attention::None; // a new task started
+            }
+        }
+        for (t, b, i, col) in notes {
+            self.notify(ctx, &t, &b, i, col);
+        }
+        // a Windows toast was clicked → bring the window up on that project
+        while let Ok(root) = self.toast_click_rx.try_recv() {
+            if let Some(i) = self.projects.iter().position(|p| p.root == root) {
+                self.switch(i);
+            }
+            ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(ViewportCommand::Focus);
+        }
+        if attention && !self.focused {
+            ctx.send_viewport_cmd(ViewportCommand::RequestUserAttention(egui::UserAttentionType::Informational));
+        }
+        if self.projects.iter().any(|p| p.chat.busy || !p.git.busy.is_empty()) {
+            // gentle animation tick instead of continuous repainting
+            ctx.request_repaint_after(Duration::from_millis(160));
+        }
+    }
+
+    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        let pal = theme::palette(self.settings.dark);
+        self.toasts_ui(&ctx, &pal);
+
+        // focus tracking → reload files changed by external tools
+        let focused = ctx.input(|i| i.viewport().focused.unwrap_or(true));
+        if focused && !self.focused {
+            let hl = &self.hl;
+            if let Some(p) = self.projects.get_mut(self.active) {
+                p.check_disk(hl);
+                p.tree.refresh();
+                p.git.refresh_status();
+            }
+        }
+        self.focused = focused;
+
+        // dark/light native title bar (needs the window to exist, so do it on the first frames)
+        if !self.titlebar_themed {
+            ctx.send_viewport_cmd(ViewportCommand::SetTheme(if self.settings.dark { egui::SystemTheme::Dark } else { egui::SystemTheme::Light }));
+            self.titlebar_themed = ctx.cumulative_frame_nr() > 2;
+        }
+
+        // window title
+        let title = self.projects.get(self.active).map(|p| format!("{} — VibeStorm", p.name)).unwrap_or_else(|| "VibeStorm".into());
+        if self.title_for.as_ref().map(|t| &t.1) != Some(&title) {
+            ctx.send_viewport_cmd(ViewportCommand::Title(title.clone()));
+            self.title_for = Some((self.active, title));
+        }
+
+        // close request
+        if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close {
+            let dirty = self.projects.iter().any(|p| p.dirty_count() > 0);
+            let busy = self.projects.iter().any(|p| p.chat.busy);
+            if dirty || busy {
+                ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+                self.confirm = Some(Confirm::Exit);
+            }
+        }
+
+        // drag & drop
+        let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
+        for path in dropped {
+            if path.is_dir() {
+                self.add_project(path, &ctx, true);
+                continue;
+            }
+            let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+            let is_img = ["png", "jpg", "jpeg", "gif", "webp", "bmp"].contains(&ext.as_str());
+            if is_img && self.claude_open {
+                let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                if let Some(p) = self.projects.get_mut(self.active) {
+                    match std::fs::read(&path).map_err(|e| e.to_string()).and_then(|b| crate::claude::prepare_image(&ctx, &name, b)) {
+                        Ok(a) => p.chat.attachments.push(a),
+                        Err(e) => self.message = Some((e, true)),
+                    }
+                }
+            } else if self.projects.is_empty() {
+                if let Some(parent) = path.parent() {
+                    self.add_project(parent.to_path_buf(), &ctx, true);
+                }
+                self.open_file(&path, None);
+            } else {
+                self.open_file(&path, None);
+            }
+        }
+
+        if self.prompt.is_none() && self.confirm.is_none() && self.quick.is_none() {
+            self.shortcuts(&ctx);
+        }
+
+        let mut acts: Vec<Action> = vec![];
+
+        egui::Panel::top("toolbar")
+            .exact_size(40.0)
+            .frame(Frame::NONE.fill(pal.panel_bg).inner_margin(Margin::symmetric(4, 0)))
+            .show(ui, |ui| self.toolbar(ui, &pal, &mut acts));
+
+        egui::Panel::bottom("status")
+            .exact_size(24.0)
+            .frame(Frame::NONE.fill(pal.panel_bg).inner_margin(Margin::symmetric(8, 0)))
+            .show(ui, |ui| self.status_bar(ui, &pal));
+
+        egui::Panel::left("projects_sidebar")
+            .exact_size(if self.settings.sidebar_collapsed { 50.0 } else { 220.0 })
+            .frame(Frame::NONE.fill(pal.sidebar_bg).inner_margin(Margin::symmetric(4, 0)))
+            .show(ui, |ui| self.sidebar(ui, &pal, &mut acts));
+
+        if !self.projects.is_empty() {
+            egui::Panel::left("stripe_left")
+                .exact_size(38.0)
+                .frame(Frame::NONE.fill(pal.panel_bg).inner_margin(Margin::symmetric(4, 6)))
+                .show(ui, |ui| {
+                    ui.vertical_centered(|ui| {
+                        if Self::stripe_button(ui, &pal, "🗀", "Project (Alt+1)", self.left == Some(LeftTab::Project)) {
+                            self.left = if self.left == Some(LeftTab::Project) { None } else { Some(LeftTab::Project) };
+                        }
+                        if Self::stripe_button(ui, &pal, "✔", "Commit (Alt+0)", self.left == Some(LeftTab::Commit)) {
+                            self.left = if self.left == Some(LeftTab::Commit) { None } else { Some(LeftTab::Commit) };
+                        }
+                        ui.add_space(12.0);
+                        if Self::stripe_button(ui, &pal, "⎇", "Git log (Alt+9)", self.bottom == Some(BottomTab::Git)) {
+                            self.bottom = if self.bottom == Some(BottomTab::Git) { None } else { Some(BottomTab::Git) };
+                        }
+                        if Self::stripe_button(ui, &pal, "🔍", "Find in files (Ctrl+Shift+F)", self.bottom == Some(BottomTab::Find)) {
+                            self.bottom = if self.bottom == Some(BottomTab::Find) { None } else { Some(BottomTab::Find) };
+                        }
+                    });
+                });
+            egui::Panel::right("stripe_right")
+                .exact_size(38.0)
+                .frame(Frame::NONE.fill(pal.panel_bg).inner_margin(Margin::symmetric(4, 6)))
+                .show(ui, |ui| {
+                    ui.vertical_centered(|ui| {
+                        let p = &self.projects[self.active];
+                        let icon = if p.chat.pending_approvals() > 0 { "⚠" } else { "🤖" };
+                        if Self::stripe_button(ui, &pal, icon, "Claude Code (Alt+2)", self.claude_open) {
+                            self.claude_open = !self.claude_open;
+                        }
+                    });
+                });
+
+            if let Some(tab) = self.left {
+                egui::Panel::left("left_tool")
+                    .resizable(true)
+                    .default_size(290.0)
+                    .min_size(180.0)
+                    .frame(Frame::NONE.fill(pal.panel_bg).inner_margin(Margin::symmetric(6, 6)))
+                    .show(ui, |ui| {
+                        let p = &mut self.projects[self.active];
+                        match tab {
+                            LeftTab::Project => {
+                                if let Some(a) = p.tree.ui(ui, &pal, &p.git.status_map, &p.git.dirty_dirs) {
+                                    acts.push(match a {
+                                        TreeAction::Open(path) => Action::OpenFile(path, None),
+                                        TreeAction::NewFile(d) => Action::Prompt(PromptKind::NewFile(d)),
+                                        TreeAction::NewFolder(d) => Action::Prompt(PromptKind::NewFolder(d)),
+                                        TreeAction::Rename(path) => Action::Prompt(PromptKind::Rename(path)),
+                                        TreeAction::Delete(path) => Action::Confirm(Confirm::Delete(path)),
+                                        TreeAction::Reveal(path) => Action::Reveal(path),
+                                        TreeAction::Terminal(path) => Action::Terminal(path),
+                                        TreeAction::CopyPath(s) => Action::Copy(s),
+                                        TreeAction::AskClaude(path) => Action::AskClaude(util::rel_path(&p.root, &path)),
+                                    });
+                                }
+                            }
+                            LeftTab::Commit => {
+                                for a in p.git.commit_ui(ui, &pal) {
+                                    acts.push(match a {
+                                        GitUiAction::OpenDiff { title, key, text } => Action::OpenDiff { title, key, text },
+                                        GitUiAction::OpenFile(f) => Action::OpenFile(f, None),
+                                        GitUiAction::ConfirmRollback(f) => Action::Confirm(Confirm::Rollback(f)),
+                                    });
+                                }
+                            }
+                        }
+                    });
+            }
+
+            if self.claude_open {
+                egui::Panel::right("claude_panel")
+                    .resizable(true)
+                    .default_size(460.0)
+                    .min_size(300.0)
+                    .frame(Frame::NONE.fill(pal.panel_bg))
+                    .show(ui, |ui| {
+                        let p = &mut self.projects[self.active];
+                        let last = p.last_session.clone();
+                        let active_file = p
+                            .active_doc
+                            .and_then(|i| p.docs.get(i))
+                            .filter(|d| !d.is_virtual())
+                            .map(|d| util::rel_path(&p.root, &d.path));
+                        for a in claude_ui::show(ui, &mut p.chat, &pal, last, active_file) {
+                            match a {
+                                ChatAction::OpenFile(f) => acts.push(Action::OpenFile(f, None)),
+                            }
+                        }
+                    });
+            }
+
+            if let Some(tab) = self.bottom {
+                egui::Panel::bottom("bottom_tool")
+                    .resizable(true)
+                    .default_size(260.0)
+                    .min_size(120.0)
+                    .frame(Frame::NONE.fill(pal.panel_bg).inner_margin(Margin::symmetric(8, 6)))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            if ui.selectable_label(tab == BottomTab::Git, "Git Log").clicked() {
+                                self.bottom = Some(BottomTab::Git);
+                            }
+                            if ui.selectable_label(tab == BottomTab::Find, "Find in Files").clicked() {
+                                self.bottom = Some(BottomTab::Find);
+                            }
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if ui.small_button("—").on_hover_text("Hide").clicked() {
+                                    self.bottom = None;
+                                }
+                                if tab == BottomTab::Git && ui.small_button("⟳").on_hover_text("Refresh").clicked() {
+                                    self.projects[self.active].git.refresh_all();
+                                }
+                            });
+                        });
+                        ui.separator();
+                        match tab {
+                            BottomTab::Git => {
+                                let p = &mut self.projects[self.active];
+                                for a in p.git.log_ui(ui, &pal) {
+                                    if let GitUiAction::OpenDiff { title, key, text } = a {
+                                        acts.push(Action::OpenDiff { title, key, text });
+                                    }
+                                }
+                            }
+                            BottomTab::Find => self.find_panel(ui, &pal, &mut acts),
+                        }
+                    });
+            }
+        }
+
+        // diffs requested from the commit window arrive asynchronously
+        if let Some(p) = self.projects.get_mut(self.active) {
+            for a in p.git.take_ui_actions() {
+                if let GitUiAction::OpenDiff { title, key, text } = a {
+                    acts.push(Action::OpenDiff { title, key, text });
+                }
+            }
+        }
+
+        egui::CentralPanel::default()
+            .frame(Frame::NONE.fill(pal.editor_bg))
+            .show(ui, |ui| {
+                if self.projects.is_empty() {
+                    self.welcome(ui, &pal, &mut acts);
+                    return;
+                }
+                let has_docs = !self.projects[self.active].docs.is_empty();
+                if has_docs {
+                    Frame::NONE.fill(pal.panel_bg).show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        self.tabs_bar(ui, &pal, &mut acts);
+                    });
+                }
+                let hl = &self.hl;
+                let cx = EditorCtx { hl, pal: &pal, dark: self.settings.dark, font_size: self.settings.editor_font_size };
+                let p = &mut self.projects[self.active];
+                match p.active_doc.and_then(|i| p.docs.get_mut(i)) {
+                    Some(doc) => editor::show_doc(ui, doc, &cx),
+                    None => {
+                        ui.vertical_centered(|ui| {
+                            ui.add_space(ui.available_height() * 0.35);
+                            ui.label(RichText::new(&p.name).size(20.0).color(pal.text_weak));
+                            ui.add_space(8.0);
+                            for (k, v) in [
+                                ("Go to file", "Ctrl+Shift+N"),
+                                ("Find in files", "Ctrl+Shift+F"),
+                                ("Commit", "Ctrl+K"),
+                                ("Claude Code", "Alt+2"),
+                                ("Switch project", "Ctrl+Alt+[ / ]"),
+                            ] {
+                                ui.label(RichText::new(format!("{k}   {v}")).color(pal.text_weak));
+                            }
+                        });
+                    }
+                }
+            });
+
+        self.modals(&ctx, &pal);
+        self.apply(acts, &ctx);
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.persist();
+    }
+}

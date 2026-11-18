@@ -1,0 +1,88 @@
+//! Persistent settings in %APPDATA%\VibeStorm\settings.json
+
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(default)]
+pub struct ProjectMemo {
+    pub open_files: Vec<String>,
+    pub active_file: Option<String>,
+    pub last_session: Option<String>,
+    /// unix seconds of the project's last action (agent task, save, commit…); orders RECENT
+    pub last_active: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
+pub struct Settings {
+    pub dark: bool,
+    pub editor_font_size: f32,
+    pub ui_font_size: f32,
+    pub open_projects: Vec<String>,
+    pub active_project: usize,
+    pub recent: Vec<String>,
+    pub claude_model: String,
+    pub claude_mode: String,
+    pub notify: bool,
+    pub notify_only_unfocused: bool,
+    pub notify_sound: bool,
+    pub sidebar_collapsed: bool,
+    pub memo: HashMap<String, ProjectMemo>,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            dark: true,
+            editor_font_size: 14.0,
+            ui_font_size: 13.5,
+            open_projects: vec![],
+            active_project: 0,
+            recent: vec![],
+            claude_model: "default".into(),
+            claude_mode: "acceptEdits".into(),
+            notify: true,
+            notify_only_unfocused: false,
+            notify_sound: true,
+            sidebar_collapsed: false,
+            memo: HashMap::new(),
+        }
+    }
+}
+
+impl Settings {
+    fn path() -> PathBuf {
+        let base = std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        base.join("VibeStorm").join("settings.json")
+    }
+
+    pub fn load() -> Self {
+        std::fs::read_to_string(Self::path())
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self) {
+        let p = Self::path();
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(self) {
+            let tmp = p.with_extension("json.tmp");
+            if std::fs::write(&tmp, json).is_ok() {
+                let _ = std::fs::rename(&tmp, &p);
+            }
+        }
+    }
+
+    pub fn push_recent(&mut self, path: &str) {
+        self.recent.retain(|p| !p.eq_ignore_ascii_case(path));
+        self.recent.insert(0, path.to_owned());
+        self.recent.truncate(25);
+    }
+}
