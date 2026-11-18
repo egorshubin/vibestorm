@@ -8,7 +8,11 @@ use std::path::PathBuf;
 #[serde(default)]
 pub struct ProjectMemo {
     pub open_files: Vec<String>,
+    /// `None` = a Claude Code tab was in front
     pub active_file: Option<String>,
+    /// session ids of the open conversation tabs, in tab order
+    pub chats: Vec<String>,
+    pub active_chat: Option<String>,
     pub last_session: Option<String>,
     /// unix seconds of the project's last action (agent task, save, commit…); orders RECENT
     pub last_active: u64,

@@ -165,6 +165,10 @@ pub struct Chat {
     pub take_defaults: bool,
     pub usage: Usage,
     pub rate_limits: HashMap<String, RateLimit>,
+    /// restored tab: the transcript of `resume_id` is read when the tab is first shown
+    lazy: bool,
+    /// title of a restored tab, known before its transcript is loaded
+    title_hint: Option<String>,
 }
 
 fn find_claude() -> (String, Vec<String>) {
@@ -240,6 +244,8 @@ impl Chat {
             take_defaults: false,
             usage: Usage::default(),
             rate_limits: HashMap::new(),
+            lazy: false,
+            title_hint: None,
         }
     }
 
@@ -442,6 +448,8 @@ impl Chat {
         self.stats = None;
         self.usage = Usage::default();
         self.take_defaults = true;
+        self.lazy = false;
+        self.title_hint = None;
     }
 
     pub fn resume_last(&mut self, id: Option<String>) {
@@ -908,17 +916,63 @@ fn user_text(v: &Value) -> Option<String> {
     Some(t.to_owned())
 }
 
-/// Most recent conversations first (at most 200).
+/// Title of a stored conversation: its summary, else the first user message, else the last prompt.
+/// Reads only up to the first one found; `None` for sessions with nothing typed.
+fn read_title(path: &Path) -> Option<String> {
+    let f = std::fs::File::open(path).ok()?;
+    let mut last_prompt = None;
+    for line in BufReader::new(f).lines().map_while(Result::ok) {
+        let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
+        if v["type"] == "summary" {
+            if let Some(s) = v["summary"].as_str() {
+                return Some(s.to_owned());
+            }
+        }
+        if v["type"] == "user" {
+            if let Some(t) = user_text(&v) {
+                return Some(t.lines().next().unwrap_or("").to_owned());
+            }
+        }
+        if v["type"] == "last-prompt" && last_prompt.is_none() {
+            last_prompt = v["lastPrompt"].as_str().map(|s| s.lines().next().unwrap_or("").to_owned());
+        }
+    }
+    last_prompt
+}
+
+/// `read_title` memoized: a found title never changes, a missing one is retried when the file grows.
+fn cached_title(path: &Path, len: u64) -> Option<String> {
+    static CACHE: std::sync::Mutex<Option<HashMap<PathBuf, (u64, Option<String>)>>> = std::sync::Mutex::new(None);
+    let mut guard = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let cache = guard.get_or_insert_with(HashMap::new);
+    match cache.get(path) {
+        Some((_, Some(t))) => return Some(t.clone()),
+        Some((l, None)) if *l == len => return None,
+        _ => {}
+    }
+    let t = read_title(path).map(|t| crate::util::truncate(&t, 80));
+    cache.insert(path.to_owned(), (len, t.clone()));
+    t
+}
+
+/// Title of the stored conversation `id` in `cwd`, without loading its transcript.
+pub fn session_title(cwd: &Path, id: &str) -> Option<String> {
+    let path = sessions_dir(cwd)?.join(format!("{id}.jsonl"));
+    let len = std::fs::metadata(&path).ok()?.len();
+    cached_title(&path, len)
+}
+
+/// Most recent conversations first.
 pub fn list_sessions(cwd: &Path) -> Vec<SessionInfo> {
     let Some(dir) = sessions_dir(cwd) else { return vec![] };
-    let mut files: Vec<(u64, PathBuf)> = std::fs::read_dir(dir)
+    let mut files: Vec<(u64, u64, PathBuf)> = std::fs::read_dir(dir)
         .map(|rd| {
             rd.flatten()
                 .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl"))
                 .filter_map(|e| {
-                    let m = e.metadata().ok()?.modified().ok()?;
-                    let secs = m.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
-                    Some((secs, e.path()))
+                    let meta = e.metadata().ok()?;
+                    let secs = meta.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+                    Some((secs, meta.len(), e.path()))
                 })
                 .collect()
         })
@@ -926,31 +980,10 @@ pub fn list_sessions(cwd: &Path) -> Vec<SessionInfo> {
     files.sort_by(|a, b| b.0.cmp(&a.0));
     files
         .into_iter()
-        .take(200)
-        .filter_map(|(modified, path)| {
+        .filter_map(|(modified, len, path)| {
             let id = path.file_stem()?.to_string_lossy().into_owned();
-            let f = std::fs::File::open(&path).ok()?;
-            let mut title = None;
-            for line in BufReader::new(f).lines().take(400).map_while(Result::ok) {
-                if line.len() > 200_000 {
-                    continue;
-                }
-                let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
-                if v["type"] == "summary" {
-                    if let Some(s) = v["summary"].as_str() {
-                        title = Some(s.to_owned());
-                        break;
-                    }
-                }
-                if v["type"] == "user" {
-                    if let Some(t) = user_text(&v) {
-                        title = Some(t.lines().next().unwrap_or("").to_owned());
-                        break;
-                    }
-                }
-            }
-            let title = title?; // skip empty sessions
-            Some(SessionInfo { id, title: crate::util::truncate(&title, 80), modified })
+            let title = cached_title(&path, len)?; // skip empty sessions
+            Some(SessionInfo { id, title, modified })
         })
         .collect()
 }
@@ -1044,12 +1077,32 @@ impl Chat {
         self.session_id = None;
     }
 
+    /// Like `open_session`, but only remembers the id: nothing is read until `ensure_loaded`.
+    pub fn restore_session(&mut self, id: &str) {
+        self.new_chat();
+        self.resume_id = Some(id.to_owned());
+        self.title_hint = session_title(&self.cwd, id);
+        self.lazy = true;
+    }
+
+    /// Load the transcript of a restored tab (call before showing it).
+    pub fn ensure_loaded(&mut self) {
+        if self.lazy {
+            if let Some(id) = self.resume_id.clone() {
+                self.open_session(&id);
+            }
+        }
+    }
+
     /// Title of the current conversation (first user message).
     pub fn title(&self) -> Option<String> {
-        self.items.iter().find_map(|i| match i {
-            Item::User { text, .. } if !text.is_empty() => Some(crate::util::truncate(text.lines().next().unwrap_or(""), 60)),
-            _ => None,
-        })
+        self.items
+            .iter()
+            .find_map(|i| match i {
+                Item::User { text, .. } if !text.is_empty() => Some(crate::util::truncate(text.lines().next().unwrap_or(""), 60)),
+                _ => None,
+            })
+            .or_else(|| self.title_hint.as_ref().map(|t| crate::util::truncate(t, 60)))
     }
 }
 
@@ -1060,11 +1113,14 @@ mod history_tests {
     #[test]
     #[ignore = "reads this machine's ~/.claude sessions; run with --ignored"]
     fn reads_real_sessions() {
-        let home = std::env::var("USERPROFILE").unwrap();
-        let cwd = PathBuf::from(&home);
+        // VS_TEST_CWD picks the project folder (default: the home folder)
+        let cwd = PathBuf::from(std::env::var("VS_TEST_CWD").or_else(|_| std::env::var("USERPROFILE")).unwrap());
         let t = std::time::Instant::now();
         let list = list_sessions(&cwd);
         eprintln!("sessions: {} in {:?}", list.len(), t.elapsed());
+        let t = std::time::Instant::now();
+        let again = list_sessions(&cwd);
+        eprintln!("again (cached titles): {} in {:?}", again.len(), t.elapsed());
         for s in list.iter().take(3) {
             eprintln!("  {} | {} | {}", &s.id[..8], s.title, crate::util::fmt_ago(s.modified));
         }

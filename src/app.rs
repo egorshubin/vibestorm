@@ -73,6 +73,20 @@ impl Project {
             last_active: if memo.last_active > 0 { memo.last_active } else { util::unix_now() },
             root,
         };
+        // conversation tabs come back as bare session ids: the transcript is read when a tab is
+        // first shown, the process starts on the next message
+        for (n, id) in memo.chats.iter().enumerate() {
+            if n > 0 {
+                let c = p.chats[0].sibling();
+                p.chats.push(c);
+            }
+            p.chats[n].restore_session(id);
+        }
+        p.active_chat = memo
+            .active_chat
+            .as_ref()
+            .and_then(|a| p.chats.iter().position(|c| c.holds_session(a)))
+            .unwrap_or(0);
         for f in &memo.open_files {
             let path = PathBuf::from(f);
             if path.is_file() {
@@ -84,6 +98,22 @@ impl Project {
             .as_ref()
             .and_then(|a| p.docs.iter().position(|d| d.path.to_string_lossy() == *a));
         p
+    }
+
+    fn chat_ids(&self) -> impl Iterator<Item = &String> {
+        self.chats.iter().filter_map(|c| c.session_id.as_ref().or(c.resume_id.as_ref()))
+    }
+
+    /// Changes whenever the set of open tabs or the tab in front does; triggers a settings save.
+    fn tabs_sig(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for d in &self.docs {
+            d.path.hash(&mut h);
+        }
+        self.chat_ids().for_each(|id| id.hash(&mut h));
+        (self.active_doc, self.active_chat).hash(&mut h);
+        h.finish()
     }
 
     fn memo(&self) -> ProjectMemo {
@@ -99,7 +129,9 @@ impl Project {
                 .and_then(|i| self.docs.get(i))
                 .filter(|d| !d.is_virtual())
                 .map(|d| d.path.to_string_lossy().into_owned()),
-            last_session: self.chat().session_id.clone().or(self.last_session.clone()),
+            chats: self.chat_ids().cloned().collect(),
+            active_chat: self.chat().session_id.clone().or(self.chat().resume_id.clone()),
+            last_session:self.chat().session_id.clone().or(self.last_session.clone()),
             last_active: self.last_active,
         }
     }
@@ -143,6 +175,7 @@ impl Project {
         self.active_chat = i.min(self.chats.len() - 1);
         self.active_doc = None;
         let c = self.chat_mut();
+        c.ensure_loaded();
         c.unseen = false;
         c.focus_input = true;
     }
@@ -292,6 +325,8 @@ pub struct IdeApp {
     toast_click_rx: std::sync::mpsc::Receiver<PathBuf>,
     /// account-wide plan limits from Anthropic (all clients, not just our agents)
     plan: PlanUsage,
+    /// `Project::tabs_sig` of the active project at the last save
+    tabs_sig: u64,
 }
 
 struct InAppToast {
@@ -366,6 +401,7 @@ impl IdeApp {
             title_for: None,
             message: None,
             titlebar_themed: false,
+            tabs_sig: 0,
             settings,
         };
         // Only the project worked with last is loaded (or the one passed on the command line);
@@ -423,7 +459,10 @@ impl IdeApp {
             self.active = i;
             let p = &mut self.projects[i];
             p.attention = Attention::None;
-            p.show_chat(p.active_chat); // Claude Code is the default view of a project
+            // back to the tab that was in front when the project was left
+            if p.active_doc.is_none_or(|d| d >= p.docs.len()) {
+                p.show_chat(p.active_chat);
+            }
             p.check_disk(&self.hl);
             p.git.refresh_status();
             self.persist();
@@ -436,6 +475,7 @@ impl IdeApp {
         for p in &self.projects {
             self.settings.memo.insert(memo_key(&p.root), p.memo());
         }
+        self.tabs_sig = self.projects.get(self.active).map(|p| p.tabs_sig()).unwrap_or(0);
         self.settings.save();
     }
 
@@ -2521,6 +2561,7 @@ impl eframe::App for IdeApp {
                     }
                     None => {
                         p.active_doc = None; // a stale index falls back to the Claude tab
+                        p.chat_mut().ensure_loaded();
                         p.chat_mut().unseen = false;
                         let last = p.last_session.clone();
                         let active_file = p
@@ -2544,6 +2585,10 @@ impl eframe::App for IdeApp {
 
         self.modals(&ctx, &pal);
         self.apply(acts, &ctx);
+        // tabs opened, closed or switched → save right away, so a crash or kill doesn't lose them
+        if self.projects.get(self.active).is_some_and(|p| p.tabs_sig() != self.tabs_sig) {
+            self.persist();
+        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
