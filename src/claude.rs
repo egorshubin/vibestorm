@@ -102,6 +102,30 @@ pub struct Todo {
     pub status: String,
 }
 
+/// Plan limit reported by Claude Code (`rate_limit_event`); account-wide.
+#[derive(Clone)]
+pub struct RateLimit {
+    /// five_hour, seven_day, seven_day_opus, ...
+    pub kind: String,
+    /// allowed, allowed_warning, rejected
+    pub status: String,
+    /// unix secs
+    pub resets_at: Option<u64>,
+    /// 0..1
+    pub utilization: Option<f64>,
+    pub at: Instant,
+}
+
+/// Usage of the running Claude process (resets with a new conversation).
+#[derive(Clone, Copy, Default)]
+pub struct Usage {
+    pub cost_usd: f64,
+    pub turns: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+}
+
 pub enum Signal {
     Done { summary: String, is_error: bool },
     NeedsApproval { tool: String },
@@ -134,6 +158,10 @@ pub struct Chat {
     pub history_at: Option<Instant>,
     /// put the cursor into the input box on the next frame
     pub focus_input: bool,
+    /// set when a fresh conversation starts: the app re-applies the saved default model and mode
+    pub take_defaults: bool,
+    pub usage: Usage,
+    pub rate_limits: HashMap<String, RateLimit>,
 }
 
 fn find_claude() -> (String, Vec<String>) {
@@ -204,6 +232,9 @@ impl Chat {
             history: vec![],
             history_at: None,
             focus_input: false,
+            take_defaults: false,
+            usage: Usage::default(),
+            rate_limits: HashMap::new(),
         }
     }
 
@@ -383,6 +414,8 @@ impl Chat {
         self.busy_since = None;
         self.live_text.clear();
         self.stats = None;
+        self.usage = Usage::default();
+        self.take_defaults = true;
     }
 
     pub fn resume_last(&mut self, id: Option<String>) {
@@ -676,11 +709,35 @@ impl Chat {
                     let err = v["result"].as_str().unwrap_or(v["subtype"].as_str().unwrap_or("error"));
                     self.items.push(Item::Error(err.to_owned()));
                 }
+                // total_cost_usd is cumulative for the process; usage is per query
+                self.usage.cost_usd = self.usage.cost_usd.max(cost);
+                self.usage.turns += turns;
+                let u = &v["usage"];
+                self.usage.input_tokens += u["input_tokens"].as_u64().unwrap_or(0) + u["cache_creation_input_tokens"].as_u64().unwrap_or(0);
+                self.usage.cache_read_tokens += u["cache_read_input_tokens"].as_u64().unwrap_or(0);
+                self.usage.output_tokens += u["output_tokens"].as_u64().unwrap_or(0);
                 self.items.push(Item::Result { text: text.clone(), is_error });
                 self.stats = Some(text);
                 let summary = v["result"].as_str().unwrap_or("").lines().find(|l| !l.trim().is_empty()).unwrap_or("Task finished").to_owned();
                 self.unseen = true;
                 signals.push(Signal::Done { summary, is_error });
+            }
+            "rate_limit_event" => {
+                let r = &v["rate_limit_info"];
+                let kind = r["rateLimitType"].as_str().unwrap_or("five_hour").to_owned();
+                let utilization = r["utilization"].as_f64().map(|u| if u > 1.0 { u / 100.0 } else { u });
+                let prev = self.rate_limits.get(&kind);
+                self.rate_limits.insert(
+                    kind.clone(),
+                    RateLimit {
+                        status: r["status"].as_str().unwrap_or("allowed").to_owned(),
+                        resets_at: r["resetsAt"].as_u64().or_else(|| r["resetsAt"].as_f64().map(|f| f as u64)),
+                        // events without a figure keep the last known one
+                        utilization: utilization.or(prev.and_then(|p| p.utilization)),
+                        kind,
+                        at: Instant::now(),
+                    },
+                );
             }
             _ => {}
         }
@@ -825,7 +882,7 @@ fn user_text(v: &Value) -> Option<String> {
     Some(t.to_owned())
 }
 
-/// Most recent conversations first (at most 40).
+/// Most recent conversations first (at most 200).
 pub fn list_sessions(cwd: &Path) -> Vec<SessionInfo> {
     let Some(dir) = sessions_dir(cwd) else { return vec![] };
     let mut files: Vec<(u64, PathBuf)> = std::fs::read_dir(dir)
@@ -843,7 +900,7 @@ pub fn list_sessions(cwd: &Path) -> Vec<SessionInfo> {
     files.sort_by(|a, b| b.0.cmp(&a.0));
     files
         .into_iter()
-        .take(40)
+        .take(200)
         .filter_map(|(modified, path)| {
             let id = path.file_stem()?.to_string_lossy().into_owned();
             let f = std::fs::File::open(&path).ok()?;

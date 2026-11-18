@@ -42,19 +42,55 @@ impl StatusKind {
 
 #[derive(Clone, Debug)]
 pub struct GitFile {
+    /// relative to the project root
     pub path: String,
     pub orig: Option<String>,
     pub kind: StatusKind,
+    /// repository folder relative to the project root ("" = the root repository)
+    pub repo: String,
+}
+
+impl GitFile {
+    /// Path inside its own repository.
+    pub fn repo_path(&self) -> &str {
+        in_repo(&self.path, &self.repo)
+    }
+    pub fn repo_orig(&self) -> Option<&str> {
+        self.orig.as_deref().map(|o| in_repo(o, &self.repo))
+    }
+}
+
+fn in_repo<'a>(path: &'a str, repo: &str) -> &'a str {
+    if repo.is_empty() {
+        return path;
+    }
+    path.strip_prefix(repo).and_then(|p| p.strip_prefix('/')).unwrap_or(path)
+}
+
+fn repo_dir(root: &Path, repo: &str) -> PathBuf {
+    if repo.is_empty() { root.to_path_buf() } else { root.join(repo) }
+}
+
+/// A git repository inside the project: the root one ("") and nested ones.
+#[derive(Clone, Default)]
+pub struct Repo {
+    pub dir: String,
+    pub branch: String,
+    pub upstream: Option<String>,
 }
 
 #[derive(Clone, Default)]
 pub struct StatusData {
+    /// the project root itself is a repository (branch/ahead/behind describe it)
     pub is_repo: bool,
     pub branch: String,
     pub upstream: Option<String>,
     pub ahead: u32,
     pub behind: u32,
+    /// changes of every repository, paths relative to the project root
     pub files: Vec<GitFile>,
+    /// root repository first, then nested ones
+    pub repos: Vec<Repo>,
 }
 
 #[derive(Clone)]
@@ -80,7 +116,7 @@ pub enum GitMsg {
     Op { label: String, result: Result<String, String> },
     Diff { title: String, key: String, text: String },
     Details { hash: String, text: String, files: Vec<(String, String)> },
-    CommitMsg(Result<String, String>),
+    CommitMsg(String, Result<String, String>),
 }
 
 pub enum GitUiAction {
@@ -98,28 +134,36 @@ pub struct GitState {
     pub log: Vec<LogRow>,
     pub local_branches: Vec<String>,
     pub remote_branches: Vec<String>,
-    pub commit_msg: String,
+    /// commit message per repository ("" = the root one)
+    pub commit_msgs: HashMap<String, String>,
     pub amend: bool,
     pub busy: Vec<String>,
     pub last_error: Option<String>,
     pub last_info: Option<String>,
     pub selected_commit: Option<String>,
     pub details: Option<(String, String, Vec<(String, String)>)>,
-    pub generating_msg: bool,
+    /// commit messages being written by Claude
+    pub generating_msg: usize,
     /// change selected in the Commit tree (shows its diff)
     pub sel_change: Option<String>,
-    pub collapsed_groups: HashSet<&'static str>,
-    /// height of the commit-message panel (drag its top edge to change)
-    pub commit_panel_h: f32,
+    pub collapsed_groups: HashSet<String>,
+    /// height of each commit-message box (drag the panel's top edge to change)
+    pub msg_box_h: f32,
+    /// a commit-message box has keyboard focus (for Ctrl+Enter)
+    pub msg_focused: bool,
     status_inflight: bool,
     status_again: bool,
-    commit_msg_pending_clear: bool,
+    /// repositories whose message is cleared once the running commit succeeds
+    commit_msg_pending_clear: Vec<String>,
     pending_ui: Vec<GitUiAction>,
     known_files: HashSet<String>,
     tx: Sender<GitMsg>,
     rx: Receiver<GitMsg>,
     ctx: egui::Context,
 }
+
+/// Height of a commit-message box showing two lines of text.
+const MSG_BOX_2_LINES: f32 = 50.0;
 
 fn run_git(root: &Path, args: &[&str]) -> Result<String, String> {
     let out = hidden_cmd("git")
@@ -197,8 +241,70 @@ fn parse_status(s: &str) -> StatusData {
             ('D', _) | (_, 'D') => StatusKind::Deleted,
             _ => StatusKind::Modified,
         };
-        d.files.push(GitFile { path, orig, kind });
+        d.files.push(GitFile { path, orig, kind, repo: String::new() });
     }
+    d.files.sort_by(|a, b| a.path.to_lowercase().cmp(&b.path.to_lowercase()));
+    d
+}
+
+/// Folders never searched for nested repositories.
+const SKIP_DIRS: &[&str] = &["node_modules", "vendor", "target", "dist", "build", "bower_components", "__pycache__", "venv"];
+
+/// Nested git repositories (folders with their own `.git`), relative to `root`, a few levels deep.
+fn nested_repos(root: &Path) -> Vec<String> {
+    fn walk(dir: &Path, rel: &str, depth: usize, out: &mut Vec<String>) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            if !e.file_type().is_ok_and(|t| t.is_dir()) {
+                continue; // also skips symlinks / junctions
+            }
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') || SKIP_DIRS.contains(&name.as_str()) {
+                continue;
+            }
+            let r = if rel.is_empty() { name } else { format!("{rel}/{name}") };
+            let p = e.path();
+            if p.join(".git").exists() {
+                out.push(r.clone());
+            }
+            if depth > 1 {
+                walk(&p, &r, depth - 1, out);
+            }
+        }
+    }
+    let mut out = vec![];
+    walk(root, "", 4, &mut out);
+    out.sort();
+    out
+}
+
+/// Status of the root repository plus every nested one, merged into one list.
+fn collect_status(root: &Path) -> StatusData {
+    const ARGS: &[&str] = &["status", "--porcelain=v1", "-z", "-b", "--untracked-files=all"];
+    let nested = nested_repos(root);
+    let (mut d, subs) = std::thread::scope(|sc| {
+        let jobs: Vec<_> = nested
+            .iter()
+            .map(|dir| sc.spawn(move || run_git(&root.join(dir), ARGS).ok().map(|s| (dir.clone(), parse_status(&s)))))
+            .collect();
+        let d = run_git(root, ARGS).map(|s| parse_status(&s)).unwrap_or_default();
+        let subs: Vec<(String, StatusData)> = jobs.into_iter().filter_map(|j| j.join().ok().flatten()).collect();
+        (d, subs)
+    });
+    if d.is_repo {
+        d.repos.push(Repo { dir: String::new(), branch: d.branch.clone(), upstream: d.upstream.clone() });
+    }
+    for (dir, sd) in subs {
+        d.repos.push(Repo { dir: dir.clone(), branch: sd.branch, upstream: sd.upstream });
+        for mut f in sd.files {
+            f.path = format!("{dir}/{}", f.path);
+            f.orig = f.orig.map(|o| format!("{dir}/{o}"));
+            f.repo = dir.clone();
+            d.files.push(f);
+        }
+    }
+    // a nested repository also shows up in its parent as an untracked folder / submodule
+    d.files.retain(|f| !nested.iter().any(|n| n == f.path.trim_end_matches('/')));
     d.files.sort_by(|a, b| a.path.to_lowercase().cmp(&b.path.to_lowercase()));
     d
 }
@@ -247,20 +353,21 @@ impl GitState {
             log: vec![],
             local_branches: vec![],
             remote_branches: vec![],
-            commit_msg: String::new(),
+            commit_msgs: HashMap::new(),
             amend: false,
             busy: vec![],
             last_error: None,
             last_info: None,
             selected_commit: None,
             details: None,
-            generating_msg: false,
+            generating_msg: 0,
             sel_change: None,
             collapsed_groups: HashSet::new(),
-            commit_panel_h: 250.0,
+            msg_box_h: MSG_BOX_2_LINES,
+            msg_focused: false,
             status_inflight: false,
             status_again: false,
-            commit_msg_pending_clear: false,
+            commit_msg_pending_clear: vec![],
             pending_ui: vec![],
             known_files: HashSet::new(),
             tx,
@@ -288,12 +395,7 @@ impl GitState {
             return;
         }
         self.status_inflight = true;
-        self.spawn(|root| {
-            match run_git(root, &["status", "--porcelain=v1", "-z", "-b", "--untracked-files=all"]) {
-                Ok(s) => GitMsg::Status(parse_status(&s)),
-                Err(_) => GitMsg::Status(StatusData::default()),
-            }
-        });
+        self.spawn(|root| GitMsg::Status(collect_status(root)));
     }
 
     pub fn refresh_log(&mut self) {
@@ -336,20 +438,25 @@ impl GitState {
         self.refresh_branches();
     }
 
-    /// Run an arbitrary git operation, then refresh everything.
+    /// Run an arbitrary git operation in the root repository, then refresh everything.
     pub fn op(&mut self, label: &str, steps: Vec<Vec<String>>) {
+        self.op_in(label, steps.into_iter().map(|s| (String::new(), s)).collect());
+    }
+
+    /// Like `op`, each step running in the given repository folder ("" = root).
+    pub fn op_in(&mut self, label: &str, steps: Vec<(String, Vec<String>)>) {
         self.busy.push(label.to_owned());
         let label = label.to_owned();
         self.spawn(move |root| {
             let mut out = String::new();
-            for step in steps {
+            for (repo, step) in steps {
                 let args: Vec<&str> = step.iter().map(|s| s.as_str()).collect();
-                match run_git(root, &args) {
+                match run_git(&repo_dir(root, &repo), &args) {
                     Ok(s) => out.push_str(&s),
                     Err(e) => {
                         return GitMsg::Op {
                             label,
-                            result: Err(e),
+                            result: Err(if repo.is_empty() { e } else { format!("[{repo}] {e}") }),
                         };
                     }
                 }
@@ -387,12 +494,22 @@ impl GitState {
         self.op(&format!("Creating {name}"), vec![vec!["checkout".into(), "-b".into(), name.into()]]);
     }
 
-    pub fn commit(&mut self, and_push: bool) {
-        let msg = self.commit_msg.trim().to_owned();
-        if msg.is_empty() && !self.amend {
-            self.last_error = Some("Commit message is empty".into());
-            return;
+    /// Repositories that have changes, in display order (root first).
+    pub fn changed_repos(&self) -> Vec<Repo> {
+        self.status.repos.iter().filter(|r| self.status.files.iter().any(|f| f.repo == r.dir)).cloned().collect()
+    }
+
+    /// Display name of a repository: the project folder for the root one.
+    pub fn repo_title(&self, dir: &str) -> String {
+        if dir.is_empty() {
+            self.root.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| self.root.display().to_string())
+        } else {
+            dir.to_owned()
         }
+    }
+
+    /// Commit the checked files; every repository gets its own commit with its own message.
+    pub fn commit(&mut self, and_push: bool) {
         let selected: Vec<GitFile> = self
             .status
             .files
@@ -404,62 +521,86 @@ impl GitState {
             self.last_error = Some("No files selected for commit".into());
             return;
         }
-        let all = selected.len() == self.status.files.len();
-        let mut steps: Vec<Vec<String>> = vec![];
-        let mut commit: Vec<String> = vec!["commit".into()];
-        if self.amend {
-            commit.push("--amend".into());
-            if msg.is_empty() {
-                commit.push("--no-edit".into());
+        let mut repos: Vec<String> =
+            self.status.repos.iter().map(|r| r.dir.clone()).filter(|d| selected.iter().any(|f| &f.repo == d)).collect();
+        if repos.is_empty() {
+            repos.push(String::new()); // amend without files: the root repository
+        }
+        for dir in &repos {
+            if self.commit_msgs.get(dir).is_none_or(|m| m.trim().is_empty()) && !self.amend {
+                let title = self.repo_title(dir);
+                self.last_error = Some(if repos.len() > 1 { format!("Commit message for {title} is empty") } else { "Commit message is empty".into() });
+                return;
             }
         }
-        if !msg.is_empty() {
-            commit.push("-m".into());
-            commit.push(msg);
-        }
-        if all {
-            steps.push(vec!["add".into(), "-A".into()]);
-        } else if !selected.is_empty() {
-            let mut list = String::new();
-            for f in &selected {
-                list.push_str(&f.path);
-                list.push('\0');
-                if let Some(o) = &f.orig {
-                    list.push_str(o);
-                    list.push('\0');
+        let mut steps: Vec<(String, Vec<String>)> = vec![];
+        for (k, dir) in repos.iter().enumerate() {
+            let msg = self.commit_msgs.get(dir).map(|m| m.trim().to_owned()).unwrap_or_default();
+            let sel: Vec<&GitFile> = selected.iter().filter(|f| &f.repo == dir).collect();
+            let total = self.status.files.iter().filter(|f| &f.repo == dir).count();
+            // `add -A` would also stage nested repositories as gitlinks
+            let has_nested = self.status.repos.iter().any(|r| r.dir != *dir && (dir.is_empty() || r.dir.starts_with(&format!("{dir}/"))));
+            let all = sel.len() == total && !has_nested;
+            let mut commit: Vec<String> = vec!["commit".into()];
+            if self.amend {
+                commit.push("--amend".into());
+                if msg.is_empty() {
+                    commit.push("--no-edit".into());
                 }
             }
-            let file = std::env::temp_dir().join(format!("vibestorm-pathspec-{}.txt", std::process::id()));
-            let _ = std::fs::write(&file, list);
-            let spec = format!("--pathspec-from-file={}", file.display());
-            steps.push(vec!["add".into(), "-A".into(), spec.clone(), "--pathspec-file-nul".into()]);
-            commit.push(spec);
-            commit.push("--pathspec-file-nul".into());
-        }
-        steps.push(commit);
-        if and_push {
-            if self.status.upstream.is_some() {
-                steps.push(vec!["push".into()]);
-            } else {
-                steps.push(vec!["push".into(), "-u".into(), "origin".into(), "HEAD".into()]);
+            if !msg.is_empty() {
+                commit.push("-m".into());
+                commit.push(msg);
+            }
+            if all {
+                steps.push((dir.clone(), vec!["add".into(), "-A".into()]));
+            } else if !sel.is_empty() {
+                let mut list = String::new();
+                for f in &sel {
+                    list.push_str(f.repo_path());
+                    list.push('\0');
+                    if let Some(o) = f.repo_orig() {
+                        list.push_str(o);
+                        list.push('\0');
+                    }
+                }
+                let file = std::env::temp_dir().join(format!("vibestorm-pathspec-{}-{k}.txt", std::process::id()));
+                let _ = std::fs::write(&file, list);
+                let spec = format!("--pathspec-from-file={}", file.display());
+                steps.push((dir.clone(), vec!["add".into(), "-A".into(), spec.clone(), "--pathspec-file-nul".into()]));
+                commit.push(spec);
+                commit.push("--pathspec-file-nul".into());
+            }
+            steps.push((dir.clone(), commit));
+            if and_push {
+                let upstream = self.status.repos.iter().find(|r| &r.dir == dir).and_then(|r| r.upstream.clone());
+                if upstream.is_some() {
+                    steps.push((dir.clone(), vec!["push".into()]));
+                } else {
+                    steps.push((dir.clone(), vec!["push".into(), "-u".into(), "origin".into(), "HEAD".into()]));
+                }
             }
         }
-        self.op(if and_push { "Committing and pushing" } else { "Committing" }, steps);
-        self.commit_msg_pending_clear = true;
+        self.op_in(if and_push { "Committing and pushing" } else { "Committing" }, steps);
+        self.commit_msg_pending_clear = repos;
     }
 
     pub fn rollback(&mut self, files: Vec<GitFile>) {
-        let mut tracked: Vec<String> = vec![];
+        let mut tracked: Vec<(String, Vec<String>)> = vec![];
+        let mut add = |repo: &str, p: &str| match tracked.iter_mut().find(|(r, _)| r == repo) {
+            Some((_, l)) => l.push(p.to_owned()),
+            None => tracked.push((repo.to_owned(), vec![p.to_owned()])),
+        };
         for f in &files {
             if f.kind == StatusKind::Untracked || f.kind == StatusKind::Added && f.orig.is_none() {
                 let _ = std::fs::remove_file(self.root.join(&f.path));
                 if f.kind == StatusKind::Added {
-                    tracked.push(f.path.clone());
+                    add(&f.repo, f.repo_path());
                 }
             } else {
-                tracked.push(f.path.clone());
-                if let Some(o) = &f.orig {
-                    tracked.push(o.clone());
+                add(&f.repo, f.repo_path());
+                if let Some(o) = f.repo_orig() {
+                    add(&f.repo, o);
                 }
             }
         }
@@ -467,27 +608,31 @@ impl GitState {
             self.refresh_status();
             return;
         }
-        let mut args: Vec<String> = vec![
-            "restore".into(),
-            "--source=HEAD".into(),
-            "--staged".into(),
-            "--worktree".into(),
-            "--".into(),
-        ];
-        args.extend(tracked);
-        self.op("Rolling back", vec![args]);
+        let steps = tracked
+            .into_iter()
+            .map(|(repo, paths)| {
+                let mut args: Vec<String> =
+                    vec!["restore".into(), "--source=HEAD".into(), "--staged".into(), "--worktree".into(), "--".into()];
+                args.extend(paths);
+                (repo, args)
+            })
+            .collect();
+        self.op_in("Rolling back", steps);
     }
 
     pub fn show_file_diff(&self, f: &GitFile) {
         let path = f.path.clone();
+        let rel = f.repo_path().to_owned();
+        let repo = f.repo.clone();
         let kind = f.kind;
         self.spawn(move |root| {
+            let dir = repo_dir(root, &repo);
             let text = if kind == StatusKind::Untracked {
-                run_git(root, &["diff", "--no-index", "--", "/dev/null", &path])
+                run_git(&dir, &["diff", "--no-index", "--", "/dev/null", &rel])
                     .or_else(|e| if e.is_empty() { Ok(String::new()) } else { Err(e) })
             } else {
-                run_git(root, &["diff", "HEAD", "--", &path])
-                    .or_else(|_| run_git(root, &["diff", "--cached", "--", &path]))
+                run_git(&dir, &["diff", "HEAD", "--", &rel])
+                    .or_else(|_| run_git(&dir, &["diff", "--cached", "--", &rel]))
             };
             // `git diff --no-index` exits 1 when files differ; its output then arrives as Err.
             let text = match text {
@@ -537,41 +682,48 @@ impl GitState {
         });
     }
 
-    /// Ask Claude (haiku, one-shot) to write a commit message from the diff.
+    /// Ask Claude (haiku, one-shot) to write a commit message from the diff,
+    /// one per repository with checked changes.
     pub fn generate_message(&mut self) {
-        if self.generating_msg {
+        if self.generating_msg > 0 {
             return;
         }
-        self.generating_msg = true;
-        let files: Vec<String> = self
-            .status
-            .files
-            .iter()
-            .filter(|f| self.checked.contains(&f.path))
-            .map(|f| f.path.clone())
-            .collect();
-        self.spawn(move |root| {
-            let mut args = vec!["diff", "HEAD", "--"];
-            for f in &files {
-                args.push(f);
+        let mut by_repo: Vec<(String, Vec<String>)> = vec![];
+        for f in self.status.files.iter().filter(|f| self.checked.contains(&f.path)) {
+            match by_repo.iter_mut().find(|(r, _)| *r == f.repo) {
+                Some((_, l)) => l.push(f.repo_path().to_owned()),
+                None => by_repo.push((f.repo.clone(), vec![f.repo_path().to_owned()])),
             }
-            let mut diff = run_git(root, &args).unwrap_or_default();
-            if diff.trim().is_empty() {
-                diff = format!("New/untracked files: {}", files.join(", "));
-            }
-            if diff.len() > 40_000 {
-                let mut cut = 40_000;
-                while !diff.is_char_boundary(cut) {
-                    cut -= 1;
+        }
+        if by_repo.is_empty() {
+            by_repo.push((String::new(), vec![]));
+        }
+        for (repo, files) in by_repo {
+            self.generating_msg += 1;
+            self.spawn(move |root| {
+                let dir = repo_dir(root, &repo);
+                let mut args = vec!["diff", "HEAD", "--"];
+                for f in &files {
+                    args.push(f);
                 }
-                diff.truncate(cut);
-                diff.push_str("\n…(truncated)");
-            }
-            let prompt = format!(
-                "Write a git commit message for the following changes. Use a concise imperative summary line (max 72 chars), then optionally a blank line and a short bullet list. Output ONLY the commit message, no quotes or code fences.\n\n{diff}"
-            );
-            GitMsg::CommitMsg(crate::claude::one_shot(root, &prompt, "haiku"))
-        });
+                let mut diff = run_git(&dir, &args).unwrap_or_default();
+                if diff.trim().is_empty() {
+                    diff = format!("New/untracked files: {}", files.join(", "));
+                }
+                if diff.len() > 40_000 {
+                    let mut cut = 40_000;
+                    while !diff.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    diff.truncate(cut);
+                    diff.push_str("\n…(truncated)");
+                }
+                let prompt = format!(
+                    "Write a git commit message for the following changes. Use a concise imperative summary line (max 72 chars), then optionally a blank line and a short bullet list. Output ONLY the commit message, no quotes or code fences.\n\n{diff}"
+                );
+                GitMsg::CommitMsg(repo, crate::claude::one_shot(&dir, &prompt, "haiku"))
+            });
+        }
     }
 
     /// Process background results. Returns true if the working tree may have changed.
@@ -617,8 +769,10 @@ impl GitState {
                             self.last_error = None;
                             let first = out.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
                             self.last_info = Some(format!("{label}: done{}", if first.is_empty() { String::new() } else { format!(" — {first}") }));
-                            if label.starts_with("Committing") && self.commit_msg_pending_clear {
-                                self.commit_msg.clear();
+                            if label.starts_with("Committing") && !self.commit_msg_pending_clear.is_empty() {
+                                for r in &self.commit_msg_pending_clear {
+                                    self.commit_msgs.remove(r);
+                                }
                                 self.amend = false;
                             }
                         }
@@ -626,7 +780,7 @@ impl GitState {
                             self.last_error = Some(format!("{label} failed: {e}"));
                         }
                     }
-                    self.commit_msg_pending_clear = false;
+                    self.commit_msg_pending_clear.clear();
                     tree_changed = true;
                     self.refresh_all();
                 }
@@ -638,10 +792,12 @@ impl GitState {
                         self.details = Some((hash, text, files));
                     }
                 }
-                GitMsg::CommitMsg(r) => {
-                    self.generating_msg = false;
+                GitMsg::CommitMsg(repo, r) => {
+                    self.generating_msg = self.generating_msg.saturating_sub(1);
                     match r {
-                        Ok(m) => self.commit_msg = m.trim().to_owned(),
+                        Ok(m) => {
+                            self.commit_msgs.insert(repo, m.trim().to_owned());
+                        }
                         Err(e) => self.last_error = Some(format!("Generating message failed: {e}")),
                     }
                 }
@@ -661,7 +817,7 @@ impl GitState {
     /// with tri-state checkboxes, resizable commit-message box, Commit / Commit and Push.
     pub fn commit_ui(&mut self, ui: &mut Ui, pal: &Palette) -> Vec<GitUiAction> {
         let mut actions = vec![];
-        if !self.status.is_repo {
+        if !self.status.is_repo && self.status.repos.is_empty() {
             ui.add_space(20.0);
             ui.vertical_centered(|ui| {
                 ui.label(RichText::new("This folder is not a git repository.").color(pal.text_weak));
@@ -703,8 +859,10 @@ impl GitState {
                         self.collapsed_groups.clear();
                     }
                     if tool_btn(ui, pal, "⊟", "Collapse All", true) {
-                        self.collapsed_groups.insert("changes");
-                        self.collapsed_groups.insert("unversioned");
+                        for r in &self.status.repos {
+                            self.collapsed_groups.insert(format!("repo:{}", r.dir));
+                            self.collapsed_groups.insert(format!("unv:{}", r.dir));
+                        }
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if !self.status.branch.is_empty() {
@@ -714,72 +872,113 @@ impl GitState {
                 });
             });
 
-        // ---------------- commit message + buttons (resizable from the top edge)
-        // Fixed height (no auto-fit to content, which made the box creep); the user
-        // changes it by dragging the panel's top edge (handled below).
-        let max_h = (ui.available_height() - 90.0).max(150.0);
-        self.commit_panel_h = self.commit_panel_h.clamp(150.0, max_h);
+        // ---------------- commit message(s) + buttons (resizable from the top edge)
+        // One message box per repository with changes. Fixed height (no auto-fit to
+        // content, which made the box creep); drag the panel's top edge to change it.
+        let mut msg_repos: Vec<(String, String, String)> =
+            self.changed_repos().into_iter().map(|r| (self.repo_title(&r.dir), r.dir, r.branch)).collect();
+        if msg_repos.is_empty() {
+            msg_repos.push((self.repo_title(""), String::new(), self.status.branch.clone()));
+        }
+        let multi = msg_repos.len() > 1;
+        let label_h = if multi { 20.0 } else { 0.0 };
+        let per_box = label_h + self.msg_box_h + 6.0;
+        // margins + amend row + buttons row
+        let fixed = 14.0 + 28.0 + 40.0;
+        let max_h = (ui.available_height() - 90.0).max(fixed + per_box);
+        let panel_h = (fixed + per_box * msg_repos.len() as f32).min(max_h);
+        let mut any_focus = false;
         let panel = egui::Panel::bottom(("commit_box", self.root.clone()))
             .resizable(false)
-            .exact_size(self.commit_panel_h)
+            .exact_size(panel_h)
             .frame(Frame::NONE.inner_margin(Margin { left: 6, right: 6, top: 8, bottom: 6 }))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut self.amend, "Amend");
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let gen_label = if self.generating_msg { "✨ Writing…" } else { "✨" };
-                        if tool_btn(ui, pal, gen_label, "Generate commit message with Claude (Haiku) from the checked changes", !self.generating_msg) {
+                        let busy = self.generating_msg > 0;
+                        let gen_label = if busy { "✨ Writing…" } else { "✨" };
+                        let tip = if multi {
+                            "Generate a commit message for each repository with Claude (Haiku) from the checked changes"
+                        } else {
+                            "Generate commit message with Claude (Haiku) from the checked changes"
+                        };
+                        if tool_btn(ui, pal, gen_label, tip, !busy) {
                             self.generate_message();
                         }
                     });
                 });
                 ui.add_space(2.0);
-                let msg_id = egui::Id::new(("commit_msg", self.root.clone()));
-                let focused = ui.memory(|m| m.has_focus(msg_id));
-                // The message box takes exactly the space left in the panel (minus the
-                // button row). It is laid out in a child Ui so its content can never
-                // make the resizable panel grow by itself.
                 let buttons_h = 30.0;
                 let gap = 6.0;
-                let box_h = (ui.available_height() - buttons_h - gap - 4.0).max(48.0);
-                let (box_rect, box_resp) = ui.allocate_exact_size(vec2(ui.available_width(), box_h), Sense::click());
-                ui.painter().rect(
-                    box_rect,
-                    6.0,
-                    pal.input_bg,
-                    Stroke::new(1.0, if focused { pal.accent } else { pal.border }),
-                    egui::StrokeKind::Inside,
-                );
-                if box_resp.clicked() {
-                    ui.memory_mut(|m| m.request_focus(msg_id));
-                }
-                let inner = box_rect.shrink(7.0);
-                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(inner));
+                let area_h = (ui.available_height() - buttons_h - gap - 4.0).max(self.msg_box_h);
                 egui::ScrollArea::vertical()
-                    .id_salt(("commit_msg_scroll", self.root.clone()))
-                    .max_height(inner.height())
+                    .id_salt(("commit_msgs_scroll", self.root.clone()))
+                    .max_height(area_h)
+                    .min_scrolled_height(area_h)
                     .auto_shrink([false, false])
-                    .show(&mut child, |ui| {
-                        ui.add(
-                            egui::TextEdit::multiline(&mut self.commit_msg)
-                                .id(msg_id)
-                                .frame(Frame::NONE)
-                                .hint_text("Commit Message")
-                                .desired_width(f32::INFINITY)
-                                .min_size(vec2(0.0, inner.height())),
-                        );
+                    .show(ui, |ui| {
+                        for (i, (title, dir, branch)) in msg_repos.iter().enumerate() {
+                            if multi {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new(title).small().strong());
+                                    if !branch.is_empty() {
+                                        ui.label(RichText::new(format!("⎇ {branch}")).small().color(pal.text_weak));
+                                    }
+                                });
+                            }
+                            // the first box keeps the id Ctrl+K focuses
+                            let msg_id = if i == 0 {
+                                egui::Id::new(("commit_msg", self.root.clone()))
+                            } else {
+                                egui::Id::new(("commit_msg", self.root.clone(), dir.clone()))
+                            };
+                            let focused = ui.memory(|m| m.has_focus(msg_id));
+                            any_focus |= focused;
+                            let (box_rect, box_resp) =
+                                ui.allocate_exact_size(vec2(ui.available_width(), self.msg_box_h), Sense::click());
+                            ui.painter().rect(
+                                box_rect,
+                                6.0,
+                                pal.input_bg,
+                                Stroke::new(1.0, if focused { pal.accent } else { pal.border }),
+                                egui::StrokeKind::Inside,
+                            );
+                            if box_resp.clicked() {
+                                ui.memory_mut(|m| m.request_focus(msg_id));
+                            }
+                            let inner = box_rect.shrink(7.0);
+                            let mut child = ui.new_child(egui::UiBuilder::new().max_rect(inner));
+                            let msg = self.commit_msgs.entry(dir.clone()).or_default();
+                            egui::ScrollArea::vertical()
+                                .id_salt(("commit_msg_scroll", self.root.clone(), dir.clone()))
+                                .max_height(inner.height())
+                                .auto_shrink([false, false])
+                                .show(&mut child, |ui| {
+                                    ui.add(
+                                        egui::TextEdit::multiline(msg)
+                                            .id(msg_id)
+                                            .frame(Frame::NONE)
+                                            .hint_text(if multi { format!("Commit Message for {title}") } else { "Commit Message".into() })
+                                            .desired_width(f32::INFINITY)
+                                            .min_size(vec2(0.0, inner.height())),
+                                    );
+                                });
+                            ui.add_space(6.0);
+                        }
                     });
                 ui.add_space(gap);
                 ui.horizontal(|ui| {
                     let n = self.checked.len();
                     let busy = !self.busy.is_empty();
                     let can = !busy;
+                    let tip = if multi { format!("Commit {n} file(s), one commit per repository  (Ctrl+Enter)") } else { format!("Commit {n} file(s)  (Ctrl+Enter)") };
                     if ui
                         .add_enabled(
                             can,
                             egui::Button::new(RichText::new("  Commit  ").color(Color32::WHITE)).fill(pal.accent).corner_radius(4),
                         )
-                        .on_hover_text(format!("Commit {n} file(s)  (Ctrl+Enter)"))
+                        .on_hover_text(tip)
                         .clicked()
                     {
                         self.commit(false);
@@ -794,7 +993,8 @@ impl GitState {
                     }
                 });
             });
-        // drag the top edge of the commit box to resize it
+        self.msg_focused = any_focus;
+        // drag the top edge of the commit box to resize the message boxes
         let pr = panel.response.rect;
         let handle = egui::Rect::from_min_max(pos2(pr.min.x, pr.min.y - 3.0), pos2(pr.max.x, pr.min.y + 3.0));
         let h = ui.interact(handle, egui::Id::new(("commit_box_resize", self.root.clone())), Sense::drag());
@@ -803,127 +1003,156 @@ impl GitState {
             ui.painter().line_segment([pos2(pr.min.x, pr.min.y), pos2(pr.max.x, pr.min.y)], Stroke::new(2.0, pal.accent));
         }
         if h.dragged() {
-            self.commit_panel_h = (self.commit_panel_h - h.drag_delta().y).clamp(150.0, max_h);
+            let n = msg_repos.len() as f32;
+            self.msg_box_h = (self.msg_box_h - h.drag_delta().y / n).clamp(MSG_BOX_2_LINES, 600.0);
         }
 
-        // ---------------- change tree
+        // ---------------- change tree: one group per repository, named after it
         egui::CentralPanel::default().frame(Frame::NONE.inner_margin(Margin::symmetric(2, 2))).show(ui, |ui| {
-            let (tracked, untracked): (Vec<GitFile>, Vec<GitFile>) =
-                self.status.files.iter().cloned().partition(|f| f.kind != StatusKind::Untracked);
-            if tracked.is_empty() && untracked.is_empty() {
+            if self.status.files.is_empty() {
                 ui.add_space(14.0);
                 ui.vertical_centered(|ui| ui.label(RichText::new("No local changes").color(pal.text_weak)));
                 return;
             }
+            enum Row {
+                Group { key: String, title: String, info: String, files: Vec<GitFile>, indent: f32 },
+                File(GitFile, f32),
+            }
+            let mut rows: Vec<Row> = vec![];
+            for r in self.status.repos.clone() {
+                let files: Vec<GitFile> = self.status.files.iter().filter(|f| f.repo == r.dir).cloned().collect();
+                if files.is_empty() {
+                    continue;
+                }
+                let (tracked, untracked): (Vec<GitFile>, Vec<GitFile>) =
+                    files.iter().cloned().partition(|f| f.kind != StatusKind::Untracked);
+                let key = format!("repo:{}", r.dir);
+                let open = !self.collapsed_groups.contains(&key);
+                let n = files.len();
+                let info = format!("{}{n} {}", if r.branch.is_empty() { String::new() } else { format!("⎇ {} · ", r.branch) }, if n == 1 { "file" } else { "files" });
+                rows.push(Row::Group { key, title: self.repo_title(&r.dir), info, files, indent: 0.0 });
+                if !open {
+                    continue;
+                }
+                rows.extend(tracked.into_iter().map(|f| Row::File(f, 1.0)));
+                if !untracked.is_empty() {
+                    let key = format!("unv:{}", r.dir);
+                    let open = !self.collapsed_groups.contains(&key);
+                    let n = untracked.len();
+                    let info = format!("{n} {}", if n == 1 { "file" } else { "files" });
+                    let files = untracked.clone();
+                    rows.push(Row::Group { key, title: "Unversioned Files".into(), info, files, indent: 1.0 });
+                    if open {
+                        rows.extend(untracked.into_iter().map(|f| Row::File(f, 2.0)));
+                    }
+                }
+            }
             let row_h = 22.0;
+            let step = 18.0;
             let mut toggle_files: Vec<(String, bool)> = vec![];
-            let mut toggle_group: Option<&'static str> = None;
+            let mut toggle_group: Option<String> = None;
             let mut select: Option<GitFile> = None;
             let mut open: Option<GitFile> = None;
             egui::ScrollArea::vertical().id_salt(("changes", self.root.clone())).auto_shrink([false, false]).show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
-                for (key, title, list) in [("changes", "Changes", &tracked), ("unversioned", "Unversioned Files", &untracked)] {
-                    if list.is_empty() {
-                        continue;
-                    }
-                    let n_checked = list.iter().filter(|f| self.checked.contains(&f.path)).count();
-                    let state = if n_checked == 0 {
-                        Some(false)
-                    } else if n_checked == list.len() {
-                        Some(true)
-                    } else {
-                        None
-                    };
-                    let open_group = !self.collapsed_groups.contains(key);
-                    // group row
-                    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click());
-                    let p = ui.painter();
-                    if resp.hovered() {
-                        p.rect_filled(rect, 3.0, pal.hover);
-                    }
-                    let mut x = rect.min.x + 4.0;
-                    p.text(pos2(x + 5.0, rect.center().y), Align2::CENTER_CENTER, if open_group { "⌄" } else { "›" }, FontId::proportional(13.0), pal.text_weak);
-                    x += 14.0;
-                    let cb = egui::Rect::from_center_size(pos2(x + 7.0, rect.center().y), vec2(13.0, 13.0));
-                    paint_check(p, cb, state, pal);
-                    x += 20.0;
-                    let g = p.layout_no_wrap(title.to_owned(), FontId::proportional(13.0), pal.text);
-                    let gw = g.size().x;
-                    p.galley(pos2(x, rect.center().y - g.size().y / 2.0), g, pal.text);
-                    let files_word = if list.len() == 1 { "file" } else { "files" };
-                    p.text(pos2(x + gw + 8.0, rect.center().y), Align2::LEFT_CENTER, format!("{} {files_word}", list.len()), FontId::proportional(12.0), pal.text_weak);
-                    if resp.clicked() {
-                        let ptr = resp.interact_pointer_pos().unwrap_or_default();
-                        if cb.expand(4.0).contains(ptr) {
-                            let on = state != Some(true);
-                            for f in list.iter() {
-                                toggle_files.push((f.path.clone(), on));
-                            }
-                        } else {
-                            toggle_group = Some(key);
-                        }
-                    }
-                    if !open_group {
-                        continue;
-                    }
-                    // file rows
-                    for f in list.iter() {
-                        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click());
-                        let p = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
-                        let is_sel = self.sel_change.as_deref() == Some(f.path.as_str());
-                        if is_sel {
-                            p.rect_filled(rect, 3.0, pal.selection);
-                        } else if resp.hovered() {
-                            p.rect_filled(rect, 3.0, pal.hover);
-                        }
-                        let mut x = rect.min.x + 22.0;
-                        let c = self.checked.contains(&f.path);
-                        let cb = egui::Rect::from_center_size(pos2(x + 7.0, rect.center().y), vec2(13.0, 13.0));
-                        paint_check(&p, cb, Some(c), pal);
-                        x += 20.0;
-                        let (dir, name) = match f.path.rfind('/') {
-                            Some(i) => (&f.path[..i], &f.path[i + 1..]),
-                            None => ("", f.path.as_str()),
-                        };
-                        let (badge, bcol) = crate::tree::file_badge(name);
-                        let bg = p.layout_no_wrap(badge.to_owned(), FontId::proportional(9.5), bcol);
-                        let bw = bg.size().x.max(12.0);
-                        p.galley(pos2(x + (bw - bg.size().x) / 2.0, rect.center().y - bg.size().y / 2.0), bg, bcol);
-                        x += bw + 6.0;
-                        let col = f.kind.color(pal);
-                        let ng = p.layout_no_wrap(name.to_owned(), FontId::proportional(13.0), col);
-                        let nw = ng.size().x;
-                        p.galley(pos2(x, rect.center().y - ng.size().y / 2.0), ng, col);
-                        if !dir.is_empty() {
-                            p.text(pos2(x + nw + 8.0, rect.center().y), Align2::LEFT_CENTER, dir, FontId::proportional(12.0), pal.text_weak);
-                        }
-                        if resp.clicked() {
-                            let ptr = resp.interact_pointer_pos().unwrap_or_default();
-                            if cb.expand(4.0).contains(ptr) {
-                                toggle_files.push((f.path.clone(), !c));
+                for row in &rows {
+                    match row {
+                        Row::Group { key, title, info, files, indent } => {
+                            let n_checked = files.iter().filter(|f| self.checked.contains(&f.path)).count();
+                            let state = if n_checked == 0 {
+                                Some(false)
+                            } else if n_checked == files.len() {
+                                Some(true)
                             } else {
-                                select = Some(f.clone());
+                                None
+                            };
+                            let open_group = !self.collapsed_groups.contains(key);
+                            let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click());
+                            let p = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+                            if resp.hovered() {
+                                p.rect_filled(rect, 3.0, pal.hover);
+                            }
+                            let mut x = rect.min.x + 4.0 + indent * step;
+                            p.text(pos2(x + 5.0, rect.center().y), Align2::CENTER_CENTER, if open_group { "⌄" } else { "›" }, FontId::proportional(13.0), pal.text_weak);
+                            x += 14.0;
+                            let cb = egui::Rect::from_center_size(pos2(x + 7.0, rect.center().y), vec2(13.0, 13.0));
+                            paint_check(&p, cb, state, pal);
+                            x += 20.0;
+                            let g = p.layout_no_wrap(title.clone(), FontId::proportional(13.0), pal.text);
+                            let gw = g.size().x;
+                            p.galley(pos2(x, rect.center().y - g.size().y / 2.0), g, pal.text);
+                            p.text(pos2(x + gw + 8.0, rect.center().y), Align2::LEFT_CENTER, info, FontId::proportional(12.0), pal.text_weak);
+                            if resp.clicked() {
+                                let ptr = resp.interact_pointer_pos().unwrap_or_default();
+                                if cb.expand(4.0).contains(ptr) {
+                                    let on = state != Some(true);
+                                    for f in files.iter() {
+                                        toggle_files.push((f.path.clone(), on));
+                                    }
+                                } else {
+                                    toggle_group = Some(key.clone());
+                                }
                             }
                         }
-                        if resp.double_clicked() {
-                            open = Some(f.clone());
-                        }
-                        resp.on_hover_text(format!("{}  ·  {}\nclick: diff · double-click: open", f.path, f.kind.letter()))
-                            .context_menu(|ui| {
-                                if ui.button("⇄  Show Diff").clicked() {
+                        Row::File(f, indent) => {
+                            let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click());
+                            let p = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+                            let is_sel = self.sel_change.as_deref() == Some(f.path.as_str());
+                            if is_sel {
+                                p.rect_filled(rect, 3.0, pal.selection);
+                            } else if resp.hovered() {
+                                p.rect_filled(rect, 3.0, pal.hover);
+                            }
+                            let mut x = rect.min.x + 22.0 + (indent - 1.0) * step;
+                            let c = self.checked.contains(&f.path);
+                            let cb = egui::Rect::from_center_size(pos2(x + 7.0, rect.center().y), vec2(13.0, 13.0));
+                            paint_check(&p, cb, Some(c), pal);
+                            x += 20.0;
+                            let rp = f.repo_path();
+                            let (dir, name) = match rp.rfind('/') {
+                                Some(i) => (&rp[..i], &rp[i + 1..]),
+                                None => ("", rp),
+                            };
+                            let (badge, bcol) = crate::tree::file_badge(name);
+                            let bg = p.layout_no_wrap(badge.to_owned(), FontId::proportional(9.5), bcol);
+                            let bw = bg.size().x.max(12.0);
+                            p.galley(pos2(x + (bw - bg.size().x) / 2.0, rect.center().y - bg.size().y / 2.0), bg, bcol);
+                            x += bw + 6.0;
+                            let col = f.kind.color(pal);
+                            let ng = p.layout_no_wrap(name.to_owned(), FontId::proportional(13.0), col);
+                            let nw = ng.size().x;
+                            p.galley(pos2(x, rect.center().y - ng.size().y / 2.0), ng, col);
+                            if !dir.is_empty() {
+                                p.text(pos2(x + nw + 8.0, rect.center().y), Align2::LEFT_CENTER, dir, FontId::proportional(12.0), pal.text_weak);
+                            }
+                            if resp.clicked() {
+                                let ptr = resp.interact_pointer_pos().unwrap_or_default();
+                                if cb.expand(4.0).contains(ptr) {
+                                    toggle_files.push((f.path.clone(), !c));
+                                } else {
                                     select = Some(f.clone());
-                                    ui.close();
                                 }
-                                if ui.button("Open File").clicked() {
-                                    open = Some(f.clone());
-                                    ui.close();
-                                }
-                                ui.separator();
-                                if ui.button("↶  Rollback…").clicked() {
-                                    actions.push(GitUiAction::ConfirmRollback(vec![f.clone()]));
-                                    ui.close();
-                                }
-                            });
+                            }
+                            if resp.double_clicked() {
+                                open = Some(f.clone());
+                            }
+                            resp.on_hover_text(format!("{}  ·  {}\nclick: diff · double-click: open", f.path, f.kind.letter()))
+                                .context_menu(|ui| {
+                                    if ui.button("⇄  Show Diff").clicked() {
+                                        select = Some(f.clone());
+                                        ui.close();
+                                    }
+                                    if ui.button("Open File").clicked() {
+                                        open = Some(f.clone());
+                                        ui.close();
+                                    }
+                                    ui.separator();
+                                    if ui.button("↶  Rollback…").clicked() {
+                                        actions.push(GitUiAction::ConfirmRollback(vec![f.clone()]));
+                                        ui.close();
+                                    }
+                                });
+                        }
                     }
                 }
             });
@@ -935,7 +1164,7 @@ impl GitState {
                 }
             }
             if let Some(k) = toggle_group {
-                if !self.collapsed_groups.remove(k) {
+                if !self.collapsed_groups.remove(&k) {
                     self.collapsed_groups.insert(k);
                 }
             }
@@ -957,10 +1186,22 @@ impl GitState {
             ui.label(RichText::new("Not a git repository").color(pal.text_weak));
             return actions;
         }
-        let details_w = (ui.available_width() * 0.36).clamp(240.0, 520.0);
         let full = ui.available_rect_before_wrap();
-        let left = egui::Rect::from_min_max(full.min, pos2(full.max.x - details_w, full.max.y));
-        let right = egui::Rect::from_min_max(pos2(full.max.x - details_w + 6.0, full.min.y), full.max);
+        // a narrow tool window stacks the details under the list instead of beside it
+        let stacked = full.width() < 760.0;
+        let (left, right) = if stacked {
+            let split = full.min.y + (full.height() * 0.6).max(120.0).min(full.height() - 80.0);
+            (
+                egui::Rect::from_min_max(full.min, pos2(full.max.x, split)),
+                egui::Rect::from_min_max(pos2(full.min.x, split + 6.0), full.max),
+            )
+        } else {
+            let details_w = (full.width() * 0.36).clamp(240.0, 520.0);
+            (
+                egui::Rect::from_min_max(full.min, pos2(full.max.x - details_w, full.max.y)),
+                egui::Rect::from_min_max(pos2(full.max.x - details_w + 6.0, full.min.y), full.max),
+            )
+        };
 
         let mut clicked: Option<String> = None;
         let mut checkout: Option<String> = None;
@@ -1029,21 +1270,25 @@ impl GitState {
                             x += br.width() + 4.0;
                         }
                         let right_x = rect.max.x - 8.0;
-                        let date_g = p.layout_no_wrap(c.date.clone(), small.clone(), pal.text_weak);
-                        let author_g = p.layout_no_wrap(c.author.clone(), small.clone(), pal.text_weak);
+                        // author and date columns only when the row has room for them
+                        let columns = w >= 560.0;
                         let date_x = right_x - 110.0;
                         let author_x = date_x - 130.0;
-                        let subj_max = (author_x - x - 10.0).max(20.0);
+                        let subj_max = if columns { author_x - x - 10.0 } else { right_x - x }.max(20.0);
                         let subj = p.layout(c.subject.clone(), font.clone(), pal.text, f32::INFINITY);
                         let clip = egui::Rect::from_min_max(pos2(x, rect.min.y), pos2(x + subj_max, rect.max.y));
                         p.with_clip_rect(clip).galley(pos2(x + 2.0, mid - subj.size().y / 2.0), subj, pal.text);
-                        p.with_clip_rect(egui::Rect::from_min_max(pos2(author_x, top), pos2(date_x - 6.0, bot)))
-                            .galley(pos2(author_x, mid - author_g.size().y / 2.0), author_g, pal.text_weak);
-                        p.galley(pos2(date_x, mid - date_g.size().y / 2.0), date_g, pal.text_weak);
+                        if columns {
+                            let date_g = p.layout_no_wrap(c.date.clone(), small.clone(), pal.text_weak);
+                            let author_g = p.layout_no_wrap(c.author.clone(), small.clone(), pal.text_weak);
+                            p.with_clip_rect(egui::Rect::from_min_max(pos2(author_x, top), pos2(date_x - 6.0, bot)))
+                                .galley(pos2(author_x, mid - author_g.size().y / 2.0), author_g, pal.text_weak);
+                            p.galley(pos2(date_x, mid - date_g.size().y / 2.0), date_g, pal.text_weak);
+                        }
                         if resp.clicked() {
                             clicked = Some(c.hash.clone());
                         }
-                        resp.on_hover_text(format!("{}  {}", c.short, c.subject)).context_menu(|ui| {
+                        resp.on_hover_text(format!("{}  {}\n{}  ·  {}", c.short, c.subject, c.author, c.date)).context_menu(|ui| {
                             if ui.button("Copy Revision Number").clicked() {
                                 ui.ctx().copy_text(c.hash.clone());
                                 ui.close();
@@ -1064,10 +1309,12 @@ impl GitState {
         }
 
         // details pane
-        ui.painter().line_segment(
-            [pos2(right.min.x - 3.0, right.min.y), pos2(right.min.x - 3.0, right.max.y)],
-            Stroke::new(1.0, pal.border),
-        );
+        let divider = if stacked {
+            [pos2(right.min.x, right.min.y - 3.0), pos2(right.max.x, right.min.y - 3.0)]
+        } else {
+            [pos2(right.min.x - 3.0, right.min.y), pos2(right.min.x - 3.0, right.max.y)]
+        };
+        ui.painter().line_segment(divider, Stroke::new(1.0, pal.border));
         ui.scope_builder(egui::UiBuilder::new().max_rect(right), |ui| {
             egui::ScrollArea::vertical().id_salt("git_details").auto_shrink([false, false]).show(ui, |ui| {
                 match &self.details {
@@ -1103,5 +1350,30 @@ impl GitState {
         let _ = ui.allocate_rect(full, Sense::hover());
         actions.append(&mut self.take_ui_actions());
         actions
+    }
+}
+
+#[cfg(test)]
+mod multi_repo_tests {
+    use super::*;
+
+    #[test]
+    fn nested_repo_changes_are_listed_under_their_repo() {
+        let root = std::env::temp_dir().join(format!("vibestorm-multirepo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let sub = root.join("libs").join("core");
+        std::fs::create_dir_all(&sub).unwrap();
+        run_git(&root, &["init", "-q"]).unwrap();
+        run_git(&sub, &["init", "-q"]).unwrap();
+        std::fs::write(root.join("a.txt"), "a").unwrap();
+        std::fs::write(sub.join("b.txt"), "b").unwrap();
+
+        let d = collect_status(&root);
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(d.is_repo);
+        assert_eq!(d.repos.iter().map(|r| r.dir.as_str()).collect::<Vec<_>>(), ["", "libs/core"]);
+        let files: Vec<(&str, &str, &str)> = d.files.iter().map(|f| (f.path.as_str(), f.repo.as_str(), f.repo_path())).collect();
+        // the nested repo itself is not listed as an untracked folder of the root repo
+        assert_eq!(files, [("a.txt", "", "a.txt"), ("libs/core/b.txt", "libs/core", "b.txt")]);
     }
 }

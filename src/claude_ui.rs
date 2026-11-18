@@ -16,6 +16,10 @@ pub const CLAUDE: Color32 = hex(0xD97757);
 
 pub enum ChatAction {
     OpenFile(PathBuf),
+    /// new default permission mode for every project (saved in settings)
+    SetMode(String),
+    /// new default model for every project (saved in settings)
+    SetModel(String),
 }
 
 enum Act {
@@ -279,7 +283,8 @@ pub fn show(
                 ui.memory_mut(|m| m.request_focus(input_id));
             }
             let focused = ui.memory(|m| m.has_focus(input_id));
-            let mut send = focused && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter));
+            // Enter sends; Shift+Enter falls through to the text box as a new line
+            let mut send = focused && !ui.input(|i| i.modifiers.shift) && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter));
             if focused && chat.busy && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
                 chat.interrupt();
             }
@@ -356,6 +361,7 @@ pub fn show(
                                 let cur = chat.mode == *id;
                                 if ui.add(egui::Button::selectable(cur, mode_label(id))).on_hover_text(format!("{label}: {tip}")).clicked() {
                                     chat.set_mode(id);
+                                    out.push(ChatAction::SetMode(id.to_string()));
                                 }
                             }
                         });
@@ -366,6 +372,7 @@ pub fn show(
                             for (id, label) in MODELS {
                                 if ui.add(egui::Button::selectable(chat.model == *id, *label)).clicked() {
                                     chat.set_model(id);
+                                    out.push(ChatAction::SetModel(id.to_string()));
                                 }
                             }
                         });

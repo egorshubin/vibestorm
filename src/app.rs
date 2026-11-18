@@ -1,6 +1,6 @@
 //! Main application: multi-project workspace in a single window.
 
-use crate::claude::{Chat, MODELS, MODES, Signal};
+use crate::claude::{Chat, MODELS, MODES, RateLimit, Signal};
 use crate::claude_ui::{self, ChatAction};
 use crate::editor::{self, Doc, EditorCtx};
 use crate::git::{GitFile, GitState, GitUiAction};
@@ -29,7 +29,10 @@ pub struct Project {
     pub name: String,
     tree: FileTree,
     docs: Vec<Doc>,
+    /// `None` = the pinned Claude Code tab
     active_doc: Option<usize>,
+    /// last real file viewed, offered as an @-mention in the Claude tab
+    last_file: Option<PathBuf>,
     git: GitState,
     chat: Chat,
     index: FileIndex,
@@ -56,6 +59,7 @@ impl Project {
             tree: FileTree::new(root.clone()),
             docs: vec![],
             active_doc: None,
+            last_file: None,
             git: GitState::new(root.clone(), ctx.clone()),
             chat: Chat::new(root.clone(), ctx.clone(), s.claude_model.clone(), s.claude_mode.clone(), None),
             index: FileIndex::build(root.clone(), ctx.clone()),
@@ -74,8 +78,7 @@ impl Project {
         p.active_doc = memo
             .active_file
             .as_ref()
-            .and_then(|a| p.docs.iter().position(|d| d.path.to_string_lossy() == *a))
-            .or(if p.docs.is_empty() { None } else { Some(0) });
+            .and_then(|a| p.docs.iter().position(|d| d.path.to_string_lossy() == *a));
         p
     }
 
@@ -112,12 +115,9 @@ impl Project {
 enum LeftTab {
     Project,
     Commit,
-}
-
-#[derive(PartialEq, Clone, Copy)]
-enum BottomTab {
-    Git,
+    Log,
     Find,
+    Claude,
 }
 
 enum PromptKind {
@@ -155,6 +155,9 @@ enum Action {
     OpenProjectView(PathBuf, View),
     ForgetRecent(String),
     OpenFile(PathBuf, Option<usize>),
+    /// permission mode / model chosen in a Claude input: applies to all projects, persisted
+    ClaudeMode(String),
+    ClaudeModel(String),
     /// open a file and select a search match
     OpenFileAt { path: PathBuf, line: usize, col: usize, len: usize },
     OpenDiff { title: String, key: String, text: String },
@@ -179,8 +182,6 @@ pub struct IdeApp {
     projects: Vec<Project>,
     active: usize,
     left: Option<LeftTab>,
-    bottom: Option<BottomTab>,
-    claude_open: bool,
     prompt: Option<Prompt>,
     confirm: Option<Confirm>,
     quick: Option<QuickOpen>,
@@ -252,10 +253,13 @@ impl IdeApp {
             hl,
             projects: vec![],
             active: 0,
-            // VIBESTORM_VIEW=git opens the Commit + Git log tool windows on start
-            left: Some(if std::env::var("VIBESTORM_VIEW").as_deref() == Ok("git") { LeftTab::Commit } else { LeftTab::Project }),
-            bottom: if std::env::var("VIBESTORM_VIEW").as_deref() == Ok("git") { Some(BottomTab::Git) } else { None },
-            claude_open: true,
+            // VIBESTORM_VIEW=git / log / find opens that tool window on start
+            left: Some(match std::env::var("VIBESTORM_VIEW").as_deref() {
+                Ok("git") => LeftTab::Commit,
+                Ok("log") => LeftTab::Log,
+                Ok("find") => LeftTab::Find,
+                _ => LeftTab::Project,
+            }),
             prompt: None,
             confirm: None,
             quick: None,
@@ -267,17 +271,20 @@ impl IdeApp {
             titlebar_themed: false,
             settings,
         };
+        // Only the project worked with last is loaded (or the one passed on the command line);
+        // the others wait in RECENT, so no agents start for them.
         let open: Vec<String> = app.settings.open_projects.clone();
-        for p in open {
+        let last = open.get(app.settings.active_project).or(open.first()).cloned();
+        for p in open.iter().rev() {
+            app.settings.push_recent(p);
+        }
+        if let (None, Some(p)) = (&arg, last) {
             let pb = PathBuf::from(&p);
             if pb.is_dir() {
-                app.add_project(pb, &ctx, false);
+                app.add_project(pb, &ctx, true);
             }
         }
-        app.active = app.settings.active_project.min(app.projects.len().saturating_sub(1));
-        if let Some(p) = app.projects.get_mut(app.active) {
-            p.chat.focus_input = true; // Claude Code is the default view of a project
-        }
+        app.persist();
         if let Some(a) = arg {
             let pb = PathBuf::from(a);
             if pb.is_dir() {
@@ -321,7 +328,7 @@ impl IdeApp {
             p.attention = Attention::None;
             p.chat.unseen = false;
             p.chat.focus_input = true;
-            self.claude_open = true;
+            p.active_doc = None; // Claude Code is the default view of a project
             p.check_disk(&self.hl);
             p.git.refresh_status();
             self.persist();
@@ -342,11 +349,17 @@ impl IdeApp {
             View::Files => self.left = Some(LeftTab::Project),
             View::Git => {
                 self.left = Some(LeftTab::Commit);
-                self.bottom = Some(BottomTab::Git);
                 if let Some(p) = self.proj() {
                     p.git.refresh_all();
                 }
             }
+        }
+    }
+
+    fn show_claude(&mut self) {
+        if let Some(p) = self.proj() {
+            p.active_doc = None;
+            p.chat.focus_input = true;
         }
     }
 
@@ -551,7 +564,7 @@ impl IdeApp {
             self.quick = Some(QuickOpen { query: String::new(), results: vec![], computed: None, sel: 0, focus: true });
         }
         if sc(cs, Key::F) {
-            self.bottom = Some(BottomTab::Find);
+            self.left = Some(LeftTab::Find);
             if let Some(p) = self.projects.get_mut(self.active) {
                 p.find.focus = true;
                 // PhpStorm: the editor selection becomes the query
@@ -597,9 +610,12 @@ impl IdeApp {
         }
         if sc(Modifiers::COMMAND, Key::Tab) {
             if let Some(p) = self.proj() {
-                if !p.docs.is_empty() {
-                    p.active_doc = Some(p.active_doc.map(|a| (a + 1) % p.docs.len()).unwrap_or(0));
-                }
+                // the Claude tab (None) sits before the first file
+                p.active_doc = match p.active_doc {
+                    None if !p.docs.is_empty() => Some(0),
+                    Some(a) if a + 1 < p.docs.len() => Some(a + 1),
+                    _ => None,
+                };
             }
         }
         if sc(Modifiers::COMMAND, Key::K) {
@@ -621,10 +637,13 @@ impl IdeApp {
             self.left = if self.left == Some(LeftTab::Commit) { None } else { Some(LeftTab::Commit) };
         }
         if sc(Modifiers::ALT, Key::Num9) {
-            self.bottom = if self.bottom == Some(BottomTab::Git) { None } else { Some(BottomTab::Git) };
+            self.left = if self.left == Some(LeftTab::Log) { None } else { Some(LeftTab::Log) };
         }
         if sc(Modifiers::ALT, Key::Num2) {
-            self.claude_open = !self.claude_open;
+            self.show_claude();
+        }
+        if sc(Modifiers::ALT, Key::Num3) {
+            self.left = if self.left == Some(LeftTab::Claude) { None } else { Some(LeftTab::Claude) };
         }
         if sc(Modifiers::COMMAND, Key::Equals) || sc(Modifiers::COMMAND, Key::Plus) {
             self.settings.editor_font_size = (self.settings.editor_font_size + 1.0).min(32.0);
@@ -634,8 +653,7 @@ impl IdeApp {
         }
         // Ctrl+Enter in commit message
         if let Some(p) = self.projects.get_mut(self.active) {
-            let id = Id::new(("commit_msg", p.root.clone()));
-            if ctx.memory(|m| m.has_focus(id)) && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Enter)) {
+            if p.git.msg_focused && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Enter)) {
                 p.git.commit(false);
             }
         }
@@ -898,13 +916,18 @@ impl IdeApp {
     }
 
     fn stripe_button(ui: &mut Ui, pal: &Palette, icon: &str, tip: &str, on: bool) -> bool {
+        Self::stripe_button_col(ui, pal, icon, tip, on, None)
+    }
+
+    fn stripe_button_col(ui: &mut Ui, pal: &Palette, icon: &str, tip: &str, on: bool, color: Option<Color32>) -> bool {
         let (rect, resp) = ui.allocate_exact_size(vec2(30.0, 30.0), Sense::click());
         if on {
             ui.painter().rect_filled(rect, 6.0, pal.selection);
         } else if resp.hovered() {
             ui.painter().rect_filled(rect, 6.0, pal.hover);
         }
-        ui.painter().text(rect.center(), Align2::CENTER_CENTER, icon, FontId::proportional(15.0), if on { pal.text } else { pal.text_weak });
+        let col = color.unwrap_or(if on { pal.text } else { pal.text_weak });
+        ui.painter().text(rect.center(), Align2::CENTER_CENTER, icon, FontId::proportional(15.0), col);
         resp.on_hover_text(tip).clicked()
     }
 
@@ -946,7 +969,8 @@ impl IdeApp {
                     ("Claude: idle".to_owned(), pal.text_weak)
                 };
                 if ui.add(egui::Label::new(RichText::new(ct).small().color(cc)).sense(Sense::click())).clicked() {
-                    self.claude_open = true;
+                    p.active_doc = None;
+                    p.chat.focus_input = true;
                 }
                 if p.git.status.is_repo {
                     let s = &p.git.status;
@@ -981,6 +1005,42 @@ impl IdeApp {
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
+                    // pinned Claude Code tab: always first, can't be closed
+                    {
+                        let active = p.active_doc.is_none();
+                        let c = &p.chat;
+                        let (mark, mcol) = if c.pending_approvals() > 0 {
+                            ("⚠", pal.warn)
+                        } else if c.busy {
+                            (["◐", "◓", "◑", "◒"][((ui.input(|i| i.time) * 6.0) as usize) % 4], pal.accent)
+                        } else if c.unseen {
+                            ("●", FOLDER_DONE)
+                        } else {
+                            ("", pal.text_weak)
+                        };
+                        let font = FontId::proportional(13.0);
+                        let label = "Claude Code";
+                        let tw = ui.fonts_mut(|f| f.layout_no_wrap(label.into(), font.clone(), pal.text).size().x);
+                        let w = tw + if mark.is_empty() { 44.0 } else { 62.0 };
+                        let (rect, resp) = ui.allocate_exact_size(vec2(w, 32.0), Sense::click());
+                        let painter = ui.painter();
+                        if active {
+                            painter.rect_filled(rect, 0.0, pal.editor_bg);
+                            painter.rect_filled(egui::Rect::from_min_max(pos2(rect.min.x, rect.max.y - 2.0), rect.max), 0.0, pal.accent);
+                        } else if resp.hovered() {
+                            painter.rect_filled(rect, 0.0, pal.hover);
+                        }
+                        painter.text(pos2(rect.min.x + 18.0, rect.center().y), Align2::CENTER_CENTER, "✻", FontId::proportional(15.0), claude_ui::CLAUDE);
+                        painter.text(pos2(rect.min.x + 32.0, rect.center().y), Align2::LEFT_CENTER, label, font, pal.text);
+                        if !mark.is_empty() {
+                            painter.text(pos2(rect.max.x - 14.0, rect.center().y), Align2::CENTER_CENTER, mark, FontId::proportional(12.0), mcol);
+                        }
+                        painter.line_segment([rect.right_top(), rect.right_bottom()], Stroke::new(1.0, pal.border.gamma_multiply(0.5)));
+                        if resp.on_hover_text("Claude Code (Alt+2)").clicked() {
+                            p.active_doc = None;
+                            p.chat.focus_input = true;
+                        }
+                    }
                     for (i, d) in p.docs.iter().enumerate() {
                         let active = p.active_doc == Some(i);
                         let name_col = p
@@ -1060,6 +1120,150 @@ impl IdeApp {
             });
     }
 
+    /// Left tool window: plan usage, new session, all past sessions of the project.
+    fn claude_panel(&mut self, ui: &mut Ui, pal: &Palette) {
+        // plan limits are account-wide: take the freshest report from any project
+        let mut limits: Vec<RateLimit> = vec![];
+        for p in &self.projects {
+            for r in p.chat.rate_limits.values() {
+                match limits.iter_mut().find(|l| l.kind == r.kind) {
+                    Some(l) if l.at < r.at => *l = r.clone(),
+                    Some(_) => {}
+                    None => limits.push(r.clone()),
+                }
+            }
+        }
+        limits.sort_by_key(|l| (l.kind != "five_hour", l.kind.clone()));
+        let total_cost: f64 = self.projects.iter().map(|p| p.chat.usage.cost_usd).sum();
+        let multi = self.projects.len() > 1;
+        let p = &mut self.projects[self.active];
+        let mut show_claude = false;
+
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("✻").color(claude_ui::CLAUDE).size(16.0));
+            ui.label(RichText::new("Claude Code").strong());
+        });
+        ui.add_space(6.0);
+        let new_btn = egui::Button::new(RichText::new("✚  New session").color(Color32::WHITE)).fill(pal.accent);
+        if ui.add_sized(vec2(ui.available_width(), 28.0), new_btn).clicked() {
+            p.chat.new_chat();
+            show_claude = true;
+        }
+
+        ui.add_space(10.0);
+        ui.label(RichText::new("USAGE").small().strong().color(pal.text_weak));
+        ui.add_space(2.0);
+        if limits.is_empty() {
+            ui.label(RichText::new("Plan limits show up after the next reply from Claude.").small().color(pal.text_weak));
+        }
+        let now = util::unix_now();
+        for l in &limits {
+            let name = match l.kind.as_str() {
+                "five_hour" => "Current session (5 h)".to_owned(),
+                "seven_day" => "Week · all models".to_owned(),
+                "seven_day_opus" => "Week · Opus".to_owned(),
+                "seven_day_sonnet" => "Week · Sonnet".to_owned(),
+                "overage" => "Extra usage".to_owned(),
+                k => k.replace('_', " "),
+            };
+            let col = match l.status.as_str() {
+                "rejected" => pal.error,
+                "allowed_warning" => pal.warn,
+                _ => pal.accent,
+            };
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(name).small());
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let t = match (l.utilization, l.status.as_str()) {
+                        (Some(u), _) => format!("{:.0}%", u * 100.0),
+                        (None, "rejected") => "limit reached".into(),
+                        (None, "allowed_warning") => "close to limit".into(),
+                        _ => "ok".into(),
+                    };
+                    ui.label(RichText::new(t).small().color(col));
+                });
+            });
+            let frac = l.utilization.unwrap_or(if l.status == "rejected" { 1.0 } else { 0.0 }) as f32;
+            let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 5.0), Sense::hover());
+            ui.painter().rect_filled(r, 2.5, pal.hover);
+            ui.painter().rect_filled(egui::Rect::from_min_size(r.min, vec2(r.width() * frac.clamp(0.0, 1.0), r.height())), 2.5, col);
+            if let Some(t) = l.resets_at.filter(|t| *t > now) {
+                let s = t - now;
+                let left = if s >= 86400 { format!("{} d {} h", s / 86400, (s / 3600) % 24) } else { format!("{} h {} min", s / 3600, (s / 60) % 60) };
+                ui.label(RichText::new(format!("resets in {left}")).small().color(pal.text_weak));
+            }
+            ui.add_space(4.0);
+        }
+        let u = p.chat.usage;
+        let k = |n: u64| if n >= 1000 { format!("{:.1}k", n as f64 / 1000.0) } else { n.to_string() };
+        ui.add(
+            egui::Label::new(
+                RichText::new(format!(
+                    "This conversation: ${:.2} · {} turn{} · {} in / {} out · {} cached",
+                    u.cost_usd,
+                    u.turns,
+                    if u.turns == 1 { "" } else { "s" },
+                    k(u.input_tokens),
+                    k(u.output_tokens),
+                    k(u.cache_read_tokens)
+                ))
+                .small()
+                .color(pal.text_weak),
+            )
+            .wrap(),
+        );
+        if multi {
+            ui.label(RichText::new(format!("All open projects: ${total_cost:.2}")).small().color(pal.text_weak));
+        }
+
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("SESSIONS").small().strong().color(pal.text_weak));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.small_button("⟳").on_hover_text("Refresh").clicked() {
+                    p.chat.history_at = None;
+                }
+            });
+        });
+        if p.chat.history_at.is_none_or(|t| t.elapsed().as_secs() > 15) {
+            p.chat.history = crate::claude::list_sessions(&p.root);
+            p.chat.history_at = Some(std::time::Instant::now());
+        }
+        if p.chat.history.is_empty() {
+            ui.label(RichText::new("No saved conversations for this folder").small().color(pal.text_weak));
+        }
+        let mut pick = None;
+        egui::ScrollArea::vertical().id_salt("claude_sessions").auto_shrink([false, false]).show(ui, |ui| {
+            for s in &p.chat.history {
+                let current = p.chat.session_id.as_deref() == Some(s.id.as_str())
+                    || (p.chat.session_id.is_none() && p.chat.resume_id.as_deref() == Some(s.id.as_str()));
+                let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::click());
+                if current {
+                    ui.painter().rect_filled(rect, 5.0, pal.selection);
+                } else if resp.hovered() {
+                    ui.painter().rect_filled(rect, 5.0, pal.hover);
+                }
+                let pc = ui.painter().with_clip_rect(rect.shrink2(vec2(8.0, 0.0)));
+                pc.text(pos2(rect.min.x + 8.0, rect.min.y + 12.0), Align2::LEFT_CENTER, &s.title, FontId::proportional(13.0), pal.text);
+                pc.text(pos2(rect.min.x + 8.0, rect.min.y + 29.0), Align2::LEFT_CENTER, util::fmt_ago(s.modified), FontId::proportional(11.0), pal.text_weak);
+                if resp.on_hover_text(&s.title).clicked() {
+                    pick = Some(s.id.clone());
+                }
+            }
+        });
+        if let Some(id) = pick {
+            if p.chat.busy {
+                self.message = Some(("Claude is still working — stop it before switching conversations".into(), true));
+            } else {
+                p.chat.open_session(&id);
+                show_claude = true;
+            }
+        }
+        if show_claude {
+            self.show_claude();
+        }
+    }
+
     fn find_panel(&mut self, ui: &mut Ui, pal: &Palette, acts: &mut Vec<Action>) {
         let ctx = ui.ctx().clone();
         let Some(p) = self.projects.get_mut(self.active) else { return };
@@ -1071,13 +1275,14 @@ impl IdeApp {
         let mut open_sel = false;
         let mut close = false;
 
-        ui.horizontal(|ui| {
+        {
             let r = ui.add(
                 egui::TextEdit::singleline(&mut f.query)
                     .id(id)
-                    .hint_text("Find in project…   Enter: open  ·  ↑↓: navigate  ·  Esc: close")
-                    .desired_width(400.0),
-            );
+                    .hint_text("Find in project…")
+                    .desired_width(f32::INFINITY),
+            )
+            .on_hover_text("Enter: open  ·  ↑↓: navigate  ·  Esc: close");
             if f.focus {
                 r.request_focus();
                 f.focus = false;
@@ -1104,6 +1309,8 @@ impl IdeApp {
                     r.request_focus();
                 }
             }
+        }
+        ui.horizontal(|ui| {
             for (val, label, tip) in [
                 (&mut f.case, "Aa", "Match case"),
                 (&mut f.word, "W", "Whole words"),
@@ -1114,38 +1321,40 @@ impl IdeApp {
                     changed = true;
                 }
             }
-            ui.add_space(6.0);
-            let m = ui.add(
-                egui::TextEdit::singleline(&mut f.mask)
-                    .hint_text("File mask: *.rs, *.ts, src/")
-                    .desired_width(170.0),
-            );
-            changed |= m.changed();
-            if m.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                run_now = true;
-            }
-            if ui.button("⟳").on_hover_text("Search again").clicked() {
-                run_now = true;
-            }
-            ui.add_space(6.0);
-            if let Some(e) = &f.error {
-                ui.label(RichText::new(format!("✖ {e}")).color(pal.error));
-            } else if f.running {
-                ui.label(RichText::new(format!("Searching…  {} matches", f.results.len())).color(pal.accent));
-            } else if let Some(q) = &f.searched {
-                let more = if f.truncated { " (showing first 5000)" } else { "" };
-                ui.label(
-                    RichText::new(format!(
-                        "{} matches in {} files for “{}”{more}  ·  {} files searched",
-                        f.results.len(),
-                        f.file_count(),
-                        util::truncate(q, 40),
-                        f.scanned
-                    ))
-                    .color(pal.text_weak),
+            ui.add_space(4.0);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if ui.button("⟳").on_hover_text("Search again").clicked() {
+                    run_now = true;
+                }
+                let m = ui.add(
+                    egui::TextEdit::singleline(&mut f.mask)
+                        .hint_text("File mask: *.rs, *.ts, src/")
+                        .desired_width(ui.available_width()),
                 );
-            }
+                changed |= m.changed();
+                if m.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                    run_now = true;
+                }
+            });
         });
+        if let Some(e) = &f.error {
+            ui.label(RichText::new(format!("✖ {e}")).color(pal.error));
+        } else if f.running {
+            ui.label(RichText::new(format!("Searching…  {} matches", f.results.len())).color(pal.accent));
+        } else if let Some(q) = &f.searched {
+            let more = if f.truncated { " (showing first 5000)" } else { "" };
+            ui.label(
+                RichText::new(format!(
+                    "{} matches in {} files for “{}”{more}  ·  {} files searched",
+                    f.results.len(),
+                    f.file_count(),
+                    util::truncate(q, 40),
+                    f.scanned
+                ))
+                .color(pal.text_weak)
+                .size(11.5),
+            );
+        }
 
         // search as you type (debounced)
         if changed {
@@ -1227,7 +1436,7 @@ impl IdeApp {
                         } else if resp.hovered() {
                             painter.rect_filled(rect, 3.0, pal.hover);
                         }
-                        let num_right = rect.min.x + 70.0;
+                        let num_right = rect.min.x + 44.0;
                         painter.text(
                             pos2(num_right, rect.center().y),
                             Align2::RIGHT_CENTER,
@@ -1270,7 +1479,7 @@ impl IdeApp {
             }
         }
         if close {
-            self.bottom = None;
+            self.left = None;
         }
     }
 
@@ -1509,7 +1718,7 @@ impl IdeApp {
                     ui.end_row();
                 });
                 ui.add_space(8.0);
-                ui.label(RichText::new("Shortcuts: Ctrl+Shift+N go to file · Ctrl+Shift+F find in files · Ctrl+F find · Ctrl+G go to line · Ctrl+S save all · Ctrl+K commit · Ctrl+Shift+K push · Ctrl+T pull · Alt+1 project · Alt+0 commit · Alt+9 git log · Alt+2 Claude · Ctrl+Alt+[ / ] switch project · Ctrl+± font size").small().color(pal.text_weak));
+                ui.label(RichText::new("Shortcuts: Ctrl+Shift+N go to file · Ctrl+Shift+F find in files · Ctrl+F find · Ctrl+G go to line · Ctrl+S save all · Ctrl+K commit · Ctrl+Shift+K push · Ctrl+T pull · Alt+1 project · Alt+0 commit · Alt+9 git log · Alt+2 Claude tab · Alt+3 Claude sessions & usage · Ctrl+Alt+[ / ] switch project · Ctrl+± font size").small().color(pal.text_weak));
                 ui.add_space(8.0);
                 if ui.button("Close").clicked() {
                     close = true;
@@ -1645,6 +1854,26 @@ impl IdeApp {
         for a in acts {
             match a {
                 Action::OpenFile(p, line) => self.open_file(&p, line),
+                // the choice applies to this conversation and becomes the default for new ones;
+                // other open conversations keep theirs
+                Action::ClaudeMode(m) => {
+                    if let Some(p) = self.proj() {
+                        if p.chat.mode != m {
+                            p.chat.set_mode(&m);
+                        }
+                    }
+                    self.settings.claude_mode = m;
+                    self.settings.save();
+                }
+                Action::ClaudeModel(m) => {
+                    if let Some(p) = self.proj() {
+                        if p.chat.model != m {
+                            p.chat.set_model(&m);
+                        }
+                    }
+                    self.settings.claude_model = m;
+                    self.settings.save();
+                }
                 Action::OpenFileAt { path, line, col, len } => {
                     self.open_file(&path, None);
                     if let Some(p) = self.projects.get_mut(self.active) {
@@ -1711,8 +1940,8 @@ impl IdeApp {
                 Action::Reveal(p) => util::reveal_in_explorer(&p),
                 Action::Copy(s) => ctx.copy_text(s),
                 Action::AskClaude(rel) => {
-                    self.claude_open = true;
                     if let Some(p) = self.proj() {
+                        p.active_doc = None;
                         if !p.chat.input.is_empty() && !p.chat.input.ends_with(' ') {
                             p.chat.input.push(' ');
                         }
@@ -1951,7 +2180,8 @@ impl eframe::App for IdeApp {
             }
             let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
             let is_img = ["png", "jpg", "jpeg", "gif", "webp", "bmp"].contains(&ext.as_str());
-            if is_img && self.claude_open {
+            let claude_tab = self.projects.get(self.active).is_some_and(|p| p.active_doc.is_none());
+            if is_img && claude_tab {
                 let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
                 if let Some(p) = self.projects.get_mut(self.active) {
                     match std::fs::read(&path).map_err(|e| e.to_string()).and_then(|b| crate::claude::prepare_image(&ctx, &name, b)) {
@@ -1971,6 +2201,13 @@ impl eframe::App for IdeApp {
 
         if self.prompt.is_none() && self.confirm.is_none() && self.quick.is_none() {
             self.shortcuts(&ctx);
+        }
+
+        for p in &mut self.projects {
+            if std::mem::take(&mut p.chat.take_defaults) {
+                p.chat.model = self.settings.claude_model.clone();
+                p.chat.mode = self.settings.claude_mode.clone();
+            }
         }
 
         let mut acts: Vec<Action> = vec![];
@@ -2003,36 +2240,66 @@ impl eframe::App for IdeApp {
                             self.left = if self.left == Some(LeftTab::Commit) { None } else { Some(LeftTab::Commit) };
                         }
                         ui.add_space(12.0);
-                        if Self::stripe_button(ui, &pal, "⎇", "Git log (Alt+9)", self.bottom == Some(BottomTab::Git)) {
-                            self.bottom = if self.bottom == Some(BottomTab::Git) { None } else { Some(BottomTab::Git) };
+                        if Self::stripe_button(ui, &pal, "⎇", "Git log (Alt+9)", self.left == Some(LeftTab::Log)) {
+                            self.left = if self.left == Some(LeftTab::Log) { None } else { Some(LeftTab::Log) };
                         }
-                        if Self::stripe_button(ui, &pal, "🔍", "Find in files (Ctrl+Shift+F)", self.bottom == Some(BottomTab::Find)) {
-                            self.bottom = if self.bottom == Some(BottomTab::Find) { None } else { Some(BottomTab::Find) };
+                        if Self::stripe_button(ui, &pal, "🔍", "Find in files (Ctrl+Shift+F)", self.left == Some(LeftTab::Find)) {
+                            self.left = if self.left == Some(LeftTab::Find) { None } else { Some(LeftTab::Find) };
+                            if self.left == Some(LeftTab::Find) {
+                                if let Some(p) = self.proj() {
+                                    p.find.focus = true;
+                                }
+                            }
                         }
-                    });
-                });
-            egui::Panel::right("stripe_right")
-                .exact_size(38.0)
-                .frame(Frame::NONE.fill(pal.panel_bg).inner_margin(Margin::symmetric(4, 6)))
-                .show(ui, |ui| {
-                    ui.vertical_centered(|ui| {
-                        let p = &self.projects[self.active];
-                        let icon = if p.chat.pending_approvals() > 0 { "⚠" } else { "🤖" };
-                        if Self::stripe_button(ui, &pal, icon, "Claude Code (Alt+2)", self.claude_open) {
-                            self.claude_open = !self.claude_open;
+                        ui.add_space(12.0);
+                        let on = self.left == Some(LeftTab::Claude);
+                        if Self::stripe_button_col(ui, &pal, "✻", "Claude Code: usage & sessions (Alt+3)", on, Some(claude_ui::CLAUDE)) {
+                            self.left = if on { None } else { Some(LeftTab::Claude) };
                         }
                     });
                 });
 
             if let Some(tab) = self.left {
-                egui::Panel::left("left_tool")
+                // the log and search lists want more room, so they keep their own width
+                let (panel_id, width) = match tab {
+                    LeftTab::Log => ("left_tool_log", 460.0),
+                    LeftTab::Find => ("left_tool_find", 420.0),
+                    _ => ("left_tool", 290.0),
+                };
+                egui::Panel::left(panel_id)
                     .resizable(true)
-                    .default_size(290.0)
+                    .default_size(width)
                     .min_size(180.0)
                     .frame(Frame::NONE.fill(pal.panel_bg).inner_margin(Margin::symmetric(6, 6)))
                     .show(ui, |ui| {
+                        match tab {
+                            LeftTab::Claude => return self.claude_panel(ui, &pal),
+                            LeftTab::Find => {
+                                ui.label(RichText::new("🔍  Find in Files").strong());
+                                ui.add_space(4.0);
+                                return self.find_panel(ui, &pal, &mut acts);
+                            }
+                            _ => {}
+                        }
                         let p = &mut self.projects[self.active];
                         match tab {
+                            LeftTab::Claude | LeftTab::Find => {}
+                            LeftTab::Log => {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new("⎇  Git Log").strong());
+                                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                        if ui.small_button("⟳").on_hover_text("Refresh").clicked() {
+                                            p.git.refresh_all();
+                                        }
+                                    });
+                                });
+                                ui.add_space(4.0);
+                                for a in p.git.log_ui(ui, &pal) {
+                                    if let GitUiAction::OpenDiff { title, key, text } = a {
+                                        acts.push(Action::OpenDiff { title, key, text });
+                                    }
+                                }
+                            }
                             LeftTab::Project => {
                                 if let Some(a) = p.tree.ui(ui, &pal, &p.git.status_map, &p.git.dirty_dirs) {
                                     acts.push(match a {
@@ -2060,66 +2327,6 @@ impl eframe::App for IdeApp {
                         }
                     });
             }
-
-            if self.claude_open {
-                egui::Panel::right("claude_panel")
-                    .resizable(true)
-                    .default_size(460.0)
-                    .min_size(300.0)
-                    .frame(Frame::NONE.fill(pal.panel_bg))
-                    .show(ui, |ui| {
-                        let p = &mut self.projects[self.active];
-                        let last = p.last_session.clone();
-                        let active_file = p
-                            .active_doc
-                            .and_then(|i| p.docs.get(i))
-                            .filter(|d| !d.is_virtual())
-                            .map(|d| util::rel_path(&p.root, &d.path));
-                        for a in claude_ui::show(ui, &mut p.chat, &pal, last, active_file) {
-                            match a {
-                                ChatAction::OpenFile(f) => acts.push(Action::OpenFile(f, None)),
-                            }
-                        }
-                    });
-            }
-
-            if let Some(tab) = self.bottom {
-                egui::Panel::bottom("bottom_tool")
-                    .resizable(true)
-                    .default_size(260.0)
-                    .min_size(120.0)
-                    .frame(Frame::NONE.fill(pal.panel_bg).inner_margin(Margin::symmetric(8, 6)))
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            if ui.selectable_label(tab == BottomTab::Git, "Git Log").clicked() {
-                                self.bottom = Some(BottomTab::Git);
-                            }
-                            if ui.selectable_label(tab == BottomTab::Find, "Find in Files").clicked() {
-                                self.bottom = Some(BottomTab::Find);
-                            }
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if ui.small_button("—").on_hover_text("Hide").clicked() {
-                                    self.bottom = None;
-                                }
-                                if tab == BottomTab::Git && ui.small_button("⟳").on_hover_text("Refresh").clicked() {
-                                    self.projects[self.active].git.refresh_all();
-                                }
-                            });
-                        });
-                        ui.separator();
-                        match tab {
-                            BottomTab::Git => {
-                                let p = &mut self.projects[self.active];
-                                for a in p.git.log_ui(ui, &pal) {
-                                    if let GitUiAction::OpenDiff { title, key, text } = a {
-                                        acts.push(Action::OpenDiff { title, key, text });
-                                    }
-                                }
-                            }
-                            BottomTab::Find => self.find_panel(ui, &pal, &mut acts),
-                        }
-                    });
-            }
         }
 
         // diffs requested from the commit window arrive asynchronously
@@ -2138,33 +2345,36 @@ impl eframe::App for IdeApp {
                     self.welcome(ui, &pal, &mut acts);
                     return;
                 }
-                let has_docs = !self.projects[self.active].docs.is_empty();
-                if has_docs {
-                    Frame::NONE.fill(pal.panel_bg).show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        self.tabs_bar(ui, &pal, &mut acts);
-                    });
-                }
+                Frame::NONE.fill(pal.panel_bg).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    self.tabs_bar(ui, &pal, &mut acts);
+                });
                 let hl = &self.hl;
                 let cx = EditorCtx { hl, pal: &pal, dark: self.settings.dark, font_size: self.settings.editor_font_size };
                 let p = &mut self.projects[self.active];
                 match p.active_doc.and_then(|i| p.docs.get_mut(i)) {
-                    Some(doc) => editor::show_doc(ui, doc, &cx),
+                    Some(doc) => {
+                        if !doc.is_virtual() {
+                            p.last_file = Some(doc.path.clone());
+                        }
+                        editor::show_doc(ui, doc, &cx);
+                    }
                     None => {
-                        ui.vertical_centered(|ui| {
-                            ui.add_space(ui.available_height() * 0.35);
-                            ui.label(RichText::new(&p.name).size(20.0).color(pal.text_weak));
-                            ui.add_space(8.0);
-                            for (k, v) in [
-                                ("Go to file", "Ctrl+Shift+N"),
-                                ("Find in files", "Ctrl+Shift+F"),
-                                ("Commit", "Ctrl+K"),
-                                ("Claude Code", "Alt+2"),
-                                ("Switch project", "Ctrl+Alt+[ / ]"),
-                            ] {
-                                ui.label(RichText::new(format!("{k}   {v}")).color(pal.text_weak));
+                        p.active_doc = None; // a stale index falls back to the Claude tab
+                        p.chat.unseen = false;
+                        let last = p.last_session.clone();
+                        let active_file = p
+                            .last_file
+                            .as_ref()
+                            .filter(|f| p.docs.iter().any(|d| &d.path == *f))
+                            .map(|f| util::rel_path(&p.root, f));
+                        for a in claude_ui::show(ui, &mut p.chat, &pal, last, active_file) {
+                            match a {
+                                ChatAction::OpenFile(f) => acts.push(Action::OpenFile(f, None)),
+                                ChatAction::SetMode(m) => acts.push(Action::ClaudeMode(m)),
+                                ChatAction::SetModel(m) => acts.push(Action::ClaudeModel(m)),
                             }
-                        });
+                        }
                     }
                 }
             });
