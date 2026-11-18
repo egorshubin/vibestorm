@@ -109,6 +109,8 @@ pub struct GitState {
     /// change selected in the Commit tree (shows its diff)
     pub sel_change: Option<String>,
     pub collapsed_groups: HashSet<&'static str>,
+    /// height of the commit-message panel (drag its top edge to change)
+    pub commit_panel_h: f32,
     status_inflight: bool,
     status_again: bool,
     commit_msg_pending_clear: bool,
@@ -255,6 +257,7 @@ impl GitState {
             generating_msg: false,
             sel_change: None,
             collapsed_groups: HashSet::new(),
+            commit_panel_h: 250.0,
             status_inflight: false,
             status_again: false,
             commit_msg_pending_clear: false,
@@ -712,11 +715,13 @@ impl GitState {
             });
 
         // ---------------- commit message + buttons (resizable from the top edge)
-        egui::Panel::bottom(("commit_box", self.root.clone()))
-            .resizable(true)
-            .default_size(200.0)
-            .min_size(140.0)
-            .max_size((ui.available_height() - 80.0).max(150.0))
+        // Fixed height (no auto-fit to content, which made the box creep); the user
+        // changes it by dragging the panel's top edge (handled below).
+        let max_h = (ui.available_height() - 90.0).max(150.0);
+        self.commit_panel_h = self.commit_panel_h.clamp(150.0, max_h);
+        let panel = egui::Panel::bottom(("commit_box", self.root.clone()))
+            .resizable(false)
+            .exact_size(self.commit_panel_h)
             .frame(Frame::NONE.inner_margin(Margin { left: 6, right: 6, top: 8, bottom: 6 }))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
@@ -731,30 +736,40 @@ impl GitState {
                 ui.add_space(2.0);
                 let msg_id = egui::Id::new(("commit_msg", self.root.clone()));
                 let focused = ui.memory(|m| m.has_focus(msg_id));
-                let buttons_h = 34.0;
-                let box_h = (ui.available_height() - buttons_h).max(50.0);
-                Frame::NONE
-                    .fill(pal.input_bg)
-                    .stroke(Stroke::new(1.0, if focused { pal.accent } else { pal.border }))
-                    .corner_radius(6)
-                    .inner_margin(Margin::same(6))
-                    .show(ui, |ui| {
-                        egui::ScrollArea::vertical()
-                            .id_salt(("commit_msg_scroll", self.root.clone()))
-                            .max_height(box_h - 12.0)
-                            .min_scrolled_height(box_h - 12.0)
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                ui.add_sized(
-                                    vec2(ui.available_width(), box_h - 12.0),
-                                    egui::TextEdit::multiline(&mut self.commit_msg)
-                                        .id(msg_id)
-                                        .frame(Frame::NONE)
-                                        .hint_text("Commit Message"),
-                                );
-                            });
+                // The message box takes exactly the space left in the panel (minus the
+                // button row). It is laid out in a child Ui so its content can never
+                // make the resizable panel grow by itself.
+                let buttons_h = 30.0;
+                let gap = 6.0;
+                let box_h = (ui.available_height() - buttons_h - gap - 4.0).max(48.0);
+                let (box_rect, box_resp) = ui.allocate_exact_size(vec2(ui.available_width(), box_h), Sense::click());
+                ui.painter().rect(
+                    box_rect,
+                    6.0,
+                    pal.input_bg,
+                    Stroke::new(1.0, if focused { pal.accent } else { pal.border }),
+                    egui::StrokeKind::Inside,
+                );
+                if box_resp.clicked() {
+                    ui.memory_mut(|m| m.request_focus(msg_id));
+                }
+                let inner = box_rect.shrink(7.0);
+                let mut child = ui.new_child(egui::UiBuilder::new().max_rect(inner));
+                egui::ScrollArea::vertical()
+                    .id_salt(("commit_msg_scroll", self.root.clone()))
+                    .max_height(inner.height())
+                    .auto_shrink([false, false])
+                    .show(&mut child, |ui| {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.commit_msg)
+                                .id(msg_id)
+                                .frame(Frame::NONE)
+                                .hint_text("Commit Message")
+                                .desired_width(f32::INFINITY)
+                                .min_size(vec2(0.0, inner.height())),
+                        );
                     });
-                ui.add_space(6.0);
+                ui.add_space(gap);
                 ui.horizontal(|ui| {
                     let n = self.checked.len();
                     let busy = !self.busy.is_empty();
@@ -779,6 +794,17 @@ impl GitState {
                     }
                 });
             });
+        // drag the top edge of the commit box to resize it
+        let pr = panel.response.rect;
+        let handle = egui::Rect::from_min_max(pos2(pr.min.x, pr.min.y - 3.0), pos2(pr.max.x, pr.min.y + 3.0));
+        let h = ui.interact(handle, egui::Id::new(("commit_box_resize", self.root.clone())), Sense::drag());
+        if h.hovered() || h.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+            ui.painter().line_segment([pos2(pr.min.x, pr.min.y), pos2(pr.max.x, pr.min.y)], Stroke::new(2.0, pal.accent));
+        }
+        if h.dragged() {
+            self.commit_panel_h = (self.commit_panel_h - h.drag_delta().y).clamp(150.0, max_h);
+        }
 
         // ---------------- change tree
         egui::CentralPanel::default().frame(Frame::NONE.inner_margin(Margin::symmetric(2, 2))).show(ui, |ui| {
