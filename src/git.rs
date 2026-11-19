@@ -77,6 +77,8 @@ pub struct Repo {
     pub dir: String,
     pub branch: String,
     pub upstream: Option<String>,
+    /// commits on HEAD that are not pushed yet, newest first
+    pub outgoing: Vec<Commit>,
 }
 
 #[derive(Clone, Default)]
@@ -278,24 +280,49 @@ fn nested_repos(root: &Path) -> Vec<String> {
     out
 }
 
+/// Commits on HEAD not pushed yet: ahead of the upstream, or (no upstream yet) on no remote branch.
+fn outgoing(dir: &Path, d: &StatusData) -> Vec<Commit> {
+    const FMT: &str = "--pretty=format:\x1f%H\x1f%h\x1f%D\x1f%s\x1f%an\x1f%ad";
+    let r = if d.upstream.is_some() {
+        if d.ahead == 0 {
+            return vec![];
+        }
+        run_git(dir, &["log", "-n", "200", "--date=relative", FMT, "@{u}..HEAD"])
+    } else {
+        // without any remote there is nowhere to push to
+        if run_git(dir, &["remote"]).is_ok_and(|s| s.trim().is_empty()) {
+            return vec![];
+        }
+        run_git(dir, &["log", "-n", "200", "--date=relative", FMT, "HEAD", "--not", "--remotes"])
+    };
+    r.map(|s| parse_log(&s).into_iter().filter_map(|r| r.commit).collect()).unwrap_or_default()
+}
+
 /// Status of the root repository plus every nested one, merged into one list.
 fn collect_status(root: &Path) -> StatusData {
     const ARGS: &[&str] = &["status", "--porcelain=v1", "-z", "-b", "--untracked-files=all"];
     let nested = nested_repos(root);
-    let (mut d, subs) = std::thread::scope(|sc| {
+    let status = |dir: &Path| {
+        run_git(dir, ARGS).ok().map(|s| {
+            let d = parse_status(&s);
+            let out = outgoing(dir, &d);
+            (d, out)
+        })
+    };
+    let ((mut d, root_out), subs) = std::thread::scope(|sc| {
         let jobs: Vec<_> = nested
             .iter()
-            .map(|dir| sc.spawn(move || run_git(&root.join(dir), ARGS).ok().map(|s| (dir.clone(), parse_status(&s)))))
+            .map(|dir| sc.spawn(move || status(&root.join(dir)).map(|(d, out)| (dir.clone(), d, out))))
             .collect();
-        let d = run_git(root, ARGS).map(|s| parse_status(&s)).unwrap_or_default();
-        let subs: Vec<(String, StatusData)> = jobs.into_iter().filter_map(|j| j.join().ok().flatten()).collect();
+        let d = status(root).unwrap_or_default();
+        let subs: Vec<(String, StatusData, Vec<Commit>)> = jobs.into_iter().filter_map(|j| j.join().ok().flatten()).collect();
         (d, subs)
     });
     if d.is_repo {
-        d.repos.push(Repo { dir: String::new(), branch: d.branch.clone(), upstream: d.upstream.clone() });
+        d.repos.push(Repo { dir: String::new(), branch: d.branch.clone(), upstream: d.upstream.clone(), outgoing: root_out });
     }
-    for (dir, sd) in subs {
-        d.repos.push(Repo { dir: dir.clone(), branch: sd.branch, upstream: sd.upstream });
+    for (dir, sd, out) in subs {
+        d.repos.push(Repo { dir: dir.clone(), branch: sd.branch, upstream: sd.upstream, outgoing: out });
         for mut f in sd.files {
             f.path = format!("{dir}/{}", f.path);
             f.orig = f.orig.map(|o| format!("{dir}/{o}"));
@@ -682,6 +709,31 @@ impl GitState {
         });
     }
 
+    /// Whole diff of a commit in the given repository ("" = root).
+    pub fn show_commit_diff(&self, repo: &str, hash: &str) {
+        let (repo, h) = (repo.to_owned(), hash.to_owned());
+        self.spawn(move |root| {
+            let text = run_git(&repo_dir(root, &repo), &["show", "--stat", "-p", "--format=%h %s%nAuthor: %an <%ae>%nDate:   %ad%n", &h])
+                .unwrap_or_else(|e| e);
+            GitMsg::Diff {
+                title: format!("Δ @{}", &h[..h.len().min(7)]),
+                key: format!("show:{repo}:{h}"),
+                text,
+            }
+        });
+    }
+
+    /// Push one repository ("" = root), setting the upstream if it has none.
+    pub fn push_repo(&mut self, dir: &str) {
+        let upstream = self.status.repos.iter().find(|r| r.dir == dir).and_then(|r| r.upstream.clone());
+        let args = if upstream.is_some() {
+            vec!["push".into()]
+        } else {
+            vec!["push".into(), "-u".into(), "origin".into(), "HEAD".into()]
+        };
+        self.op_in("Pushing", vec![(dir.to_owned(), args)]);
+    }
+
     /// Ask Claude (haiku, one-shot) to write a commit message from the diff,
     /// one per repository with checked changes.
     pub fn generate_message(&mut self) {
@@ -1005,6 +1057,116 @@ impl GitState {
         if h.dragged() {
             let n = msg_repos.len() as f32;
             self.msg_box_h = (self.msg_box_h - h.drag_delta().y / n).clamp(MSG_BOX_2_LINES, 600.0);
+        }
+
+        // ---------------- unpushed commits, right above the commit box
+        let outgoing: Vec<Repo> = self.status.repos.iter().filter(|r| !r.outgoing.is_empty()).cloned().collect();
+        if !outgoing.is_empty() {
+            let multi = outgoing.len() > 1;
+            let row_h = 22.0;
+            let head_h = 24.0;
+            let mut toggle: Option<String> = None;
+            let mut diff: Option<(String, String)> = None;
+            let mut push: Option<String> = None;
+            let content_h: f32 = outgoing
+                .iter()
+                .map(|r| head_h + if self.collapsed_groups.contains(&format!("out:{}", r.dir)) { 0.0 } else { row_h * r.outgoing.len() as f32 })
+                .sum();
+            // up to ~7 commits visible, the rest scrolls
+            let list_h = content_h.min(head_h * outgoing.len() as f32 + row_h * 7.0);
+            egui::Panel::bottom(("commit_outgoing", self.root.clone()))
+                .resizable(false)
+                .exact_size(list_h + 7.0)
+                .frame(Frame::NONE.inner_margin(Margin { left: 2, right: 2, top: 3, bottom: 4 }))
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical().id_salt(("outgoing", self.root.clone())).auto_shrink([false, false]).show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        for r in &outgoing {
+                            let key = format!("out:{}", r.dir);
+                            let open = !self.collapsed_groups.contains(&key);
+                            let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), head_h), Sense::click());
+                            let btn = egui::Rect::from_min_max(pos2(rect.max.x - 28.0, rect.min.y), rect.max);
+                            let p = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+                            if resp.hovered() {
+                                p.rect_filled(rect, 3.0, pal.hover);
+                            }
+                            let p = p.with_clip_rect(p.clip_rect().intersect(egui::Rect::from_min_max(rect.min, pos2(btn.min.x - 2.0, rect.max.y))));
+                            let x = rect.min.x + 4.0;
+                            p.text(pos2(x + 5.0, rect.center().y), Align2::CENTER_CENTER, if open { "⌄" } else { "›" }, FontId::proportional(13.0), pal.text_weak);
+                            let title = if multi { self.repo_title(&r.dir) } else { "Unpushed".into() };
+                            let g = p.layout_no_wrap(title, FontId::proportional(13.0), pal.text);
+                            let gw = g.size().x;
+                            p.galley(pos2(x + 14.0, rect.center().y - g.size().y / 2.0), g, pal.text);
+                            let n = r.outgoing.len();
+                            let to = r.upstream.clone().unwrap_or_else(|| "origin (new branch)".into());
+                            let info = format!("{n} {} → {to}", if n == 1 { "commit" } else { "commits" });
+                            p.text(pos2(x + 14.0 + gw + 8.0, rect.center().y), Align2::LEFT_CENTER, info, FontId::proportional(12.0), pal.text_weak);
+                            if resp.clicked() {
+                                toggle = Some(key);
+                            }
+                            let can_push = self.busy.is_empty();
+                            let tip = if multi { format!("Push {}", self.repo_title(&r.dir)) } else { "Push".into() };
+                            let pushed = ui
+                                .scope_builder(egui::UiBuilder::new().max_rect(btn).layout(Layout::right_to_left(Align::Center)), |ui| {
+                                    tool_btn(ui, pal, "↑", &tip, can_push)
+                                })
+                                .inner;
+                            if pushed {
+                                push = Some(r.dir.clone());
+                            }
+                            if !open {
+                                continue;
+                            }
+                            for c in &r.outgoing {
+                                let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click());
+                                let p = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+                                if resp.hovered() {
+                                    p.rect_filled(rect, 3.0, pal.hover);
+                                }
+                                let mid = rect.center().y;
+                                let mut x = rect.min.x + 22.0;
+                                let hg = p.layout_no_wrap(c.short.clone(), FontId::monospace(11.5), pal.text_weak);
+                                let hw = hg.size().x;
+                                p.galley(pos2(x, mid - hg.size().y / 2.0), hg, pal.text_weak);
+                                x += hw + 8.0;
+                                let mut subj_max = rect.max.x - 6.0;
+                                if rect.width() >= 280.0 {
+                                    let dg = p.layout_no_wrap(c.date.clone(), FontId::proportional(11.5), pal.text_weak);
+                                    subj_max -= dg.size().x + 10.0;
+                                    p.galley(pos2(rect.max.x - 6.0 - dg.size().x, mid - dg.size().y / 2.0), dg, pal.text_weak);
+                                }
+                                let sg = p.layout_no_wrap(c.subject.clone(), FontId::proportional(13.0), pal.text);
+                                let clip = egui::Rect::from_min_max(pos2(x, rect.min.y), pos2(subj_max.max(x), rect.max.y));
+                                p.with_clip_rect(p.clip_rect().intersect(clip)).galley(pos2(x, mid - sg.size().y / 2.0), sg, pal.text);
+                                if resp.clicked() {
+                                    diff = Some((r.dir.clone(), c.hash.clone()));
+                                }
+                                resp.on_hover_text(format!("{}  {}\n{}  ·  {}\nclick: show diff", c.short, c.subject, c.author, c.date))
+                                    .context_menu(|ui| {
+                                        if ui.button("⇄  Show Diff").clicked() {
+                                            diff = Some((r.dir.clone(), c.hash.clone()));
+                                            ui.close();
+                                        }
+                                        if ui.button("Copy Revision Number").clicked() {
+                                            ui.ctx().copy_text(c.hash.clone());
+                                            ui.close();
+                                        }
+                                    });
+                            }
+                        }
+                    });
+                });
+            if let Some(k) = toggle {
+                if !self.collapsed_groups.remove(&k) {
+                    self.collapsed_groups.insert(k);
+                }
+            }
+            if let Some((repo, hash)) = diff {
+                self.show_commit_diff(&repo, &hash);
+            }
+            if let Some(dir) = push {
+                self.push_repo(&dir);
+            }
         }
 
         // ---------------- change tree: one group per repository, named after it
@@ -1375,5 +1537,33 @@ mod multi_repo_tests {
         let files: Vec<(&str, &str, &str)> = d.files.iter().map(|f| (f.path.as_str(), f.repo.as_str(), f.repo_path())).collect();
         // the nested repo itself is not listed as an untracked folder of the root repo
         assert_eq!(files, [("a.txt", "", "a.txt"), ("libs/core/b.txt", "libs/core", "b.txt")]);
+    }
+
+    #[test]
+    fn unpushed_commits_are_listed() {
+        let base = std::env::temp_dir().join(format!("vibestorm-outgoing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (remote, root) = (base.join("remote.git"), base.join("work"));
+        std::fs::create_dir_all(&remote).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        run_git(&remote, &["init", "-q", "--bare"]).unwrap();
+        run_git(&root, &["init", "-q", "-b", "main"]).unwrap();
+        run_git(&root, &["remote", "add", "origin", &remote.to_string_lossy()]).unwrap();
+        let commit = |msg: &str| {
+            std::fs::write(root.join("f.txt"), msg).unwrap();
+            run_git(&root, &["add", "-A"]).unwrap();
+            run_git(&root, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", msg]).unwrap();
+        };
+        commit("one");
+        // a branch that was never pushed: everything not on a remote
+        let subjects = |d: &StatusData| d.repos[0].outgoing.iter().map(|c| c.subject.clone()).collect::<Vec<_>>();
+        assert_eq!(subjects(&collect_status(&root)), ["one"]);
+        run_git(&root, &["push", "-q", "-u", "origin", "main"]).unwrap();
+        assert!(subjects(&collect_status(&root)).is_empty());
+        commit("two");
+        commit("three");
+        let d = collect_status(&root);
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(subjects(&d), ["three", "two"]);
     }
 }

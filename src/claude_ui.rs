@@ -65,6 +65,52 @@ fn chip(ui: &mut Ui, pal: &Palette, text: &str, tip: &str) -> egui::Response {
     resp.on_hover_text(tip)
 }
 
+/// Commands matching what is typed after the `/`: name prefix first, then anywhere in the name.
+fn command_matches(cmds: &[claude::SlashCommand], q: &str) -> Vec<(String, String)> {
+    let q = q.to_lowercase();
+    let mut v: Vec<(bool, &claude::SlashCommand)> = cmds
+        .iter()
+        .filter_map(|c| {
+            let n = c.name.to_lowercase();
+            if n.starts_with(&q) {
+                Some((false, c))
+            } else if n.contains(&q) {
+                Some((true, c))
+            } else {
+                None
+            }
+        })
+        .collect();
+    v.sort_by_key(|m| m.0);
+    v.into_iter().map(|(_, c)| (c.name.clone(), c.desc.clone())).collect()
+}
+
+/// The input box text: a known `/command` at the start and `@file` mentions are coloured.
+fn input_job(ui: &Ui, pal: &Palette, text: &str, commands: &std::collections::HashSet<String>) -> egui::text::LayoutJob {
+    let font = egui::FontSelection::Default.resolve(ui.style());
+    let base = ui.visuals().override_text_color.unwrap_or_else(|| ui.visuals().widgets.inactive.text_color());
+    let mut job = egui::text::LayoutJob::default();
+    let mut i = 0;
+    while i < text.len() {
+        let rest = &text[i..];
+        let len = match rest.find(|c: char| c.is_whitespace() != rest.starts_with(char::is_whitespace)) {
+            Some(n) => n,
+            None => rest.len(),
+        };
+        let word = &rest[..len];
+        let col = if i == 0 && word.strip_prefix('/').is_some_and(|c| commands.contains(c)) {
+            CLAUDE
+        } else if word.len() > 1 && word.starts_with('@') {
+            pal.link
+        } else {
+            base
+        };
+        job.append(word, 0.0, egui::TextFormat::simple(font.clone(), col));
+        i += len;
+    }
+    job
+}
+
 fn code_block(ui: &mut Ui, pal: &Palette, label: &str, text: &str, max_lines: usize) {
     let mut s: String = text.lines().take(max_lines).collect::<Vec<_>>().join("\n");
     let total = text.lines().count();
@@ -305,6 +351,46 @@ pub fn show(
                 ui.memory_mut(|m| m.request_focus(input_id));
             }
             let focused = ui.memory(|m| m.has_focus(input_id));
+            // slash commands: the popup lists matches while the first word is typed
+            let query = chat.input.strip_prefix('/').filter(|q| !q.contains(char::is_whitespace)).map(str::to_owned);
+            let hidden = chat.cmd_hidden_for.as_deref() == Some(chat.input.as_str());
+            let matches = match &query {
+                Some(q) if focused && !hidden => command_matches(chat.commands(), q),
+                _ => vec![],
+            };
+            let known: std::collections::HashSet<String> =
+                if chat.input.starts_with('/') { chat.commands().iter().map(|c| c.name.clone()).collect() } else { Default::default() };
+            let q_id = Id::new(("cmd_query", uid));
+            if ui.data(|d| d.get_temp::<Option<String>>(q_id)) != Some(query.clone()) {
+                ui.data_mut(|d| d.insert_temp(q_id, query.clone()));
+                chat.cmd_sel = 0;
+                // a popup's first frame only measures it: draw it for real right away
+                ui.ctx().request_repaint();
+            }
+            chat.cmd_sel = chat.cmd_sel.min(matches.len().saturating_sub(1));
+            // (name, then send) of the command to put into the input
+            let mut complete: Option<(String, bool)> = None;
+            let mut sel_moved = false;
+            if !matches.is_empty() {
+                ui.input_mut(|i| {
+                    if i.consume_key(Modifiers::NONE, Key::ArrowDown) {
+                        chat.cmd_sel = (chat.cmd_sel + 1) % matches.len();
+                        sel_moved = true;
+                    }
+                    if i.consume_key(Modifiers::NONE, Key::ArrowUp) {
+                        chat.cmd_sel = (chat.cmd_sel + matches.len() - 1) % matches.len();
+                        sel_moved = true;
+                    }
+                    if i.consume_key(Modifiers::NONE, Key::Tab) {
+                        complete = Some((matches[chat.cmd_sel].0.clone(), false));
+                    } else if !i.modifiers.shift && i.consume_key(Modifiers::NONE, Key::Enter) {
+                        complete = Some((matches[chat.cmd_sel].0.clone(), true));
+                    }
+                    if i.consume_key(Modifiers::NONE, Key::Escape) {
+                        chat.cmd_hidden_for = Some(chat.input.clone());
+                    }
+                });
+            }
             // Enter sends; Shift+Enter falls through to the text box as a new line
             let mut send = focused && !ui.input(|i| i.modifiers.shift) && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Enter));
             if focused && chat.busy && ui.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
@@ -342,7 +428,7 @@ pub fn show(
                 });
                 ui.add_space(2.0);
             }
-            Frame::NONE
+            let input_box = Frame::NONE
                 .fill(pal.input_bg)
                 .stroke(Stroke::new(1.0, if focused { CLAUDE.gamma_multiply(0.8) } else { pal.border }))
                 .corner_radius(10)
@@ -363,14 +449,22 @@ pub fn show(
                         }
                         ui.add_space(4.0);
                     }
+                    let mut layouter = |ui: &Ui, buf: &dyn egui::TextBuffer, wrap: f32| {
+                        let mut job = input_job(ui, pal, buf.as_str(), &known);
+                        job.wrap.max_width = wrap;
+                        ui.fonts_mut(|f| f.layout_job(job))
+                    };
                     egui::ScrollArea::vertical().id_salt(("claude_input_scroll", uid)).max_height(220.0).show(ui, |ui| {
                         ui.add(
                             egui::TextEdit::multiline(&mut chat.input)
                                 .id(input_id)
                                 .frame(Frame::NONE)
-                                .hint_text("Ask Claude to edit, explain or fix…")
+                                .hint_text("Ask Claude to edit, explain or fix…  (/ for commands)")
                                 .desired_rows(2)
-                                .desired_width(f32::INFINITY),
+                                .desired_width(f32::INFINITY)
+                                // keeps Tab in the box while it completes a command
+                                .lock_focus(!matches.is_empty())
+                                .layouter(&mut layouter),
                         );
                     });
                     ui.add_space(4.0);
@@ -449,6 +543,59 @@ pub fn show(
                         });
                     });
                 });
+            if !matches.is_empty() {
+                let r = input_box.response.rect;
+                egui::Area::new(Id::new(("cmd_popup", uid)))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(r.left_top() - vec2(0.0, 4.0))
+                    .pivot(Align2::LEFT_BOTTOM)
+                    .show(ui.ctx(), |ui| {
+                        Frame::popup(ui.style()).show(ui, |ui| {
+                            ui.set_width(r.width() - 14.0);
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            let font = FontId::proportional(13.0);
+                            // descriptions line up after the longest name (within reason)
+                            let col = matches
+                                .iter()
+                                .map(|(n, _)| ui.painter().layout_no_wrap(format!("/{n}"), font.clone(), pal.text).size().x)
+                                .fold(0.0, f32::max)
+                                .min(r.width() * 0.45);
+                            egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                                for (i, (name, desc)) in matches.iter().enumerate() {
+                                    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::click());
+                                    let p = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+                                    if i == chat.cmd_sel {
+                                        p.rect_filled(rect, 4.0, pal.selection);
+                                        if sel_moved {
+                                            resp.scroll_to_me(None);
+                                        }
+                                    } else if resp.hovered() {
+                                        p.rect_filled(rect, 4.0, pal.hover);
+                                    }
+                                    let y = rect.center().y;
+                                    p.text(pos2(rect.min.x + 8.0, y), Align2::LEFT_CENTER, format!("/{name}"), font.clone(), CLAUDE);
+                                    p.text(pos2(rect.min.x + 22.0 + col, y), Align2::LEFT_CENTER, desc, FontId::proportional(12.0), pal.text_weak);
+                                    // on press: the text box gives up focus before a click would complete
+                                    if resp.hovered() && ui.input(|i| i.pointer.primary_pressed()) {
+                                        complete = Some((name.clone(), false));
+                                    }
+                                }
+                            });
+                        });
+                    });
+            }
+            if let Some((name, then_send)) = complete {
+                chat.input = format!("/{name} ");
+                if then_send {
+                    send = true;
+                } else {
+                    let mut st = egui::text_edit::TextEditState::load(ui.ctx(), input_id).unwrap_or_default();
+                    let end = egui::text::CCursor::new(chat.input.chars().count());
+                    st.cursor.set_char_range(Some(egui::text::CCursorRange::one(end)));
+                    st.store(ui.ctx(), input_id);
+                    chat.focus_input = true;
+                }
+            }
             if send {
                 chat.send();
                 ui.memory_mut(|m| m.request_focus(input_id));
@@ -744,6 +891,122 @@ pub fn show(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A known command at the start and `@` mentions get colour; the rest stays plain.
+    #[test]
+    fn input_highlighting() {
+        let ctx = egui::Context::default();
+        let pal = crate::theme::palette(true);
+        let known: std::collections::HashSet<String> = ["compact".to_owned()].into();
+        let mut runs = vec![];
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            for text in ["/compact  keep @src/a.rs\nnow", "/compac x", "say /compact"] {
+                let job = input_job(ui, &pal, text, &known);
+                assert_eq!(job.text, text);
+                runs.push(job.sections.iter().map(|s| (&text[s.byte_range.start.0..s.byte_range.end.0], s.format.color)).collect::<Vec<_>>());
+            }
+        });
+        let coloured = |r: &Vec<(&str, Color32)>, c: Color32| r.iter().filter(|s| s.1 == c).map(|s| s.0.to_owned()).collect::<Vec<_>>();
+        assert_eq!(coloured(&runs[0], CLAUDE), ["/compact"]);
+        assert_eq!(coloured(&runs[0], pal.link), ["@src/a.rs"]);
+        assert!(coloured(&runs[1], CLAUDE).is_empty() && coloured(&runs[2], CLAUDE).is_empty());
+
+        let cmds: Vec<claude::SlashCommand> = ["add-dir", "compact", "security-review", "plug:add"]
+            .iter()
+            .map(|n| claude::SlashCommand { name: n.to_string(), desc: String::new() })
+            .collect();
+        let names = |q| command_matches(&cmds, q).into_iter().map(|m| m.0).collect::<Vec<_>>();
+        assert_eq!(names("add"), ["add-dir", "plug:add"]);
+        assert_eq!(names("REV"), ["security-review"]);
+        assert_eq!(names("").len(), 4);
+    }
+
+    /// Typing `/` opens the command list at once; each further letter narrows it.
+    #[test]
+    fn slash_opens_command_popup() {
+        let ctx = egui::Context::default();
+        crate::app::setup_fonts(&ctx);
+        crate::theme::apply(&ctx, true, 14.0);
+        let pal = crate::theme::palette(true);
+        let mut chat = Chat::new(std::env::temp_dir(), ctx.clone(), "default".into(), "manual".into(), None);
+        chat.focus_input = true;
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(600.0, 700.0)));
+        let mut time = 0.0;
+        let mut frame = |events: Vec<egui::Event>| {
+            let mut i = input.clone();
+            i.events = events;
+            // popups fade in: let the clock run
+            time += 0.5;
+            i.time = Some(time);
+            let out = ctx.run_ui(i, |ui| {
+                show(ui, &mut chat, &pal, None, None);
+            });
+            let mut texts = vec![];
+            for cs in &out.shapes {
+                if let egui::Shape::Text(t) = &cs.shape {
+                    texts.push(t.galley.text().to_owned());
+                }
+            }
+            texts
+        };
+        frame(vec![]);
+        frame(vec![]);
+        let shown = |texts: &[String]| texts.iter().filter(|t| t.starts_with('/') && t.len() > 1).cloned().collect::<Vec<_>>();
+        frame(vec![egui::Event::Text("/".into())]);
+        frame(vec![]); // the popup's first frame is an invisible sizing pass
+        let f = frame(vec![]);
+        let all = shown(&f);
+        assert!(all.contains(&"/compact".to_owned()) && all.contains(&"/init".to_owned()), "after '/': {all:?}");
+        frame(vec![egui::Event::Text("co".into())]);
+        frame(vec![]);
+        let some = shown(&frame(vec![]));
+        assert!(some.contains(&"/compact".to_owned()) && !some.contains(&"/init".to_owned()), "after '/co': {some:?}");
+        assert!(some.len() < all.len());
+    }
+
+    /// List numbers and bullets sit on their item's first text line.
+    #[test]
+    fn list_markers_on_text_baseline() {
+        for ppp in [1.0f32, 1.25, 1.5, 2.0] {
+            let ctx = egui::Context::default();
+            crate::app::setup_fonts(&ctx);
+            crate::theme::apply(&ctx, true, 14.0);
+            let mut cache = egui_commonmark::CommonMarkCache::default();
+            let mut input = egui::RawInput::default();
+            input.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(420.0, 400.0)));
+            input.viewports.entry(egui::ViewportId::ROOT).or_default().native_pixels_per_point = Some(ppp);
+            let md = "To fix it:\n\n1. In Chrome, check the extension.\n2. In Claude Code, see `/mcp` or `/chrome` here.\n\n- Bullet one\n- Bullet `two`\n";
+            let mut out = None;
+            for _ in 0..3 {
+                let mut o = ctx.run_ui(input.clone(), |ui| markdown(ui, &mut cache, md));
+                o.textures_delta.clear();
+                out = Some(o);
+            }
+            // (first word, x, baseline) of every text run
+            let mut runs = vec![];
+            for cs in &out.unwrap().shapes {
+                if let egui::Shape::Text(t) = &cs.shape {
+                    let r = &t.galley.rows[0];
+                    let s: String = r.row.glyphs.iter().map(|g| g.chr).collect();
+                    if let Some(g) = r.row.glyphs.iter().find(|g| !g.chr.is_whitespace()) {
+                        runs.push((s.trim().split(' ').next().unwrap_or("").to_owned(), t.pos.x, t.pos.y + r.pos.y + g.pos.y));
+                    }
+                }
+            }
+            for m in ["1.", "2.", "•"] {
+                let marks: Vec<_> = runs.iter().filter(|r| r.0 == m).collect();
+                assert!(!marks.is_empty(), "ppp {ppp}: no {m} in {runs:?}");
+                for (_, x, b) in marks {
+                    // the item's text: the next run on the right, on the same baseline
+                    assert!(
+                        runs.iter().any(|r| r.1 > *x && !["1.", "2.", "•"].contains(&r.0.as_str()) && (r.2 - b).abs() < 0.01),
+                        "ppp {ppp}: {m} at baseline {b} has no text beside it: {runs:?}"
+                    );
+                }
+            }
+        }
+    }
 
     /// Inline `code` must sit exactly on the body text's baseline, its chip around it.
     #[test]

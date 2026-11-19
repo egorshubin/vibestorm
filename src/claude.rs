@@ -30,6 +30,113 @@ pub const MODES: &[(&str, &str, &str)] = &[
     ("bypassPermissions", "Bypass", "Never ask (dangerous)"),
 ];
 
+/// Built-in slash commands that work in a `-p` stream-json session.
+const BUILTIN_COMMANDS: &[(&str, &str)] = &[
+    ("compact", "Summarize the conversation to free up context"),
+    ("context", "Show what fills the context window"),
+    ("cost", "Show token usage and cost of this session"),
+    ("init", "Create a CLAUDE.md with notes about this codebase"),
+    ("review", "Review a pull request"),
+    ("security-review", "Security review of the pending changes"),
+    ("pr-comments", "Fetch the comments of a GitHub pull request"),
+    ("release-notes", "Show the Claude Code release notes"),
+];
+
+/// Command names from the latest `init` message of any session (it also lists plugin commands);
+/// kept on disk so they are offered before the first message of the next run.
+static REPORTED_COMMANDS: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
+
+fn reported_commands_file() -> PathBuf {
+    std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join("VibeStorm").join("slash_commands.json")
+}
+
+fn reported_commands() -> Vec<String> {
+    let Ok(mut r) = REPORTED_COMMANDS.lock() else { return vec![] };
+    r.get_or_insert_with(|| {
+        std::fs::read_to_string(reported_commands_file()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+    })
+    .clone()
+}
+
+fn set_reported_commands(names: Vec<String>) {
+    if let Ok(mut r) = REPORTED_COMMANDS.lock() {
+        if r.as_ref() != Some(&names) {
+            let p = reported_commands_file();
+            if let Some(dir) = p.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            let _ = std::fs::write(p, serde_json::to_string(&names).unwrap_or_default());
+            *r = Some(names);
+        }
+    }
+}
+
+pub struct SlashCommand {
+    pub name: String,
+    pub desc: String,
+}
+
+/// `description:` from a markdown file's front matter, else its first line of text.
+fn md_description(path: &Path) -> String {
+    let s = std::fs::read_to_string(path).unwrap_or_default();
+    let mut lines = s.lines();
+    if s.starts_with("---") {
+        lines.next();
+        for l in lines.by_ref() {
+            if l.trim() == "---" {
+                break;
+            }
+            if let Some(d) = l.strip_prefix("description:") {
+                return d.trim().trim_matches(['"', '\'']).to_owned();
+            }
+        }
+    }
+    lines.map(|l| l.trim().trim_start_matches('#').trim()).find(|l| !l.is_empty()).unwrap_or("").to_owned()
+}
+
+/// `<dir>/commands/**/*.md` (subfolders become `folder:name`) and `<dir>/skills/*/SKILL.md`.
+fn scan_commands(dir: &Path, out: &mut Vec<SlashCommand>) {
+    fn walk(d: &Path, prefix: &str, out: &mut Vec<SlashCommand>) {
+        let Ok(rd) = std::fs::read_dir(d) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            if p.is_dir() {
+                walk(&p, &format!("{prefix}{stem}:"), out);
+            } else if p.extension().is_some_and(|x| x == "md") {
+                out.push(SlashCommand { name: format!("{prefix}{stem}"), desc: md_description(&p) });
+            }
+        }
+    }
+    walk(&dir.join("commands"), "", out);
+    if let Ok(rd) = std::fs::read_dir(dir.join("skills")) {
+        for e in rd.flatten() {
+            let skill = e.path().join("SKILL.md");
+            if skill.is_file() {
+                out.push(SlashCommand { name: e.file_name().to_string_lossy().into_owned(), desc: md_description(&skill) });
+            }
+        }
+    }
+}
+
+/// Slash commands offered in the input box: built-ins, the project's and the user's own
+/// commands and skills, and whatever else the CLI reported (plugins).
+pub fn slash_commands(cwd: &Path) -> Vec<SlashCommand> {
+    let mut out: Vec<SlashCommand> =
+        BUILTIN_COMMANDS.iter().map(|(n, d)| SlashCommand { name: n.to_string(), desc: d.to_string() }).collect();
+    scan_commands(&cwd.join(".claude"), &mut out);
+    if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
+        scan_commands(&PathBuf::from(home).join(".claude"), &mut out);
+    }
+    for n in reported_commands() {
+        out.push(SlashCommand { name: n, desc: String::new() });
+    }
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|c| !c.name.is_empty() && !c.name.starts_with("__") && seen.insert(c.name.clone()));
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
 pub enum CEvent {
     Json(Value),
     Stderr(String),
@@ -169,6 +276,13 @@ pub struct Chat {
     lazy: bool,
     /// title of a restored tab, known before its transcript is loaded
     title_hint: Option<String>,
+    /// slash commands for the input box (cached, see `commands()`)
+    commands: Vec<SlashCommand>,
+    commands_at: Option<Instant>,
+    /// highlighted entry of the slash command popup
+    pub cmd_sel: usize,
+    /// the popup was closed with Esc for this input text
+    pub cmd_hidden_for: Option<String>,
 }
 
 fn find_claude() -> (String, Vec<String>) {
@@ -246,7 +360,20 @@ impl Chat {
             rate_limits: HashMap::new(),
             lazy: false,
             title_hint: None,
+            commands: vec![],
+            commands_at: None,
+            cmd_sel: 0,
+            cmd_hidden_for: None,
         }
+    }
+
+    /// Slash commands, re-read from disk at most every few seconds.
+    pub fn commands(&mut self) -> &[SlashCommand] {
+        if self.commands_at.is_none_or(|t| t.elapsed().as_secs() > 5) {
+            self.commands = slash_commands(&self.cwd);
+            self.commands_at = Some(Instant::now());
+        }
+        &self.commands
     }
 
     pub fn is_running(&self) -> bool {
@@ -277,6 +404,8 @@ impl Chat {
             "stdio",
             "--permission-mode",
             &self.mode,
+            // Claude in Chrome: off in `-p` sessions unless asked for
+            "--chrome",
         ]);
         if self.model != "default" && !self.model.is_empty() {
             cmd.args(["--model", &self.model]);
@@ -605,6 +734,11 @@ impl Chat {
                     if let Some(m) = v["permissionMode"].as_str() {
                         // the CLI reports "manual" as "default"
                         self.mode = if m == "default" { "manual".to_owned() } else { m.to_owned() };
+                    }
+                    if let Some(cmds) = v["slash_commands"].as_array() {
+                        let names = cmds.iter().filter_map(|c| c.as_str().or(c["name"].as_str())).map(|s| s.trim_start_matches('/').to_owned());
+                        set_reported_commands(names.collect());
+                        self.commands_at = None;
                     }
                 }
                 "compact_boundary" => self.items.push(Item::System("Conversation compacted".into())),

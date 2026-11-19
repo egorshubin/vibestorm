@@ -892,8 +892,11 @@ impl CommonMarkViewerInternal {
             let mut events_iter = item_events.into_iter().enumerate().peekable();
 
             // Required to ensure that the content of the list item is aligned with
-            // the * or - when wrapping
-            ui.horizontal_wrapped(|ui| {
+            // the * or - when wrapping. VibeStorm: same layout and row height as the
+            // viewer's own, so the item's first line shares the marker's baseline.
+            let layout = egui::Layout::left_to_right(egui::Align::BOTTOM).with_main_wrap(true);
+            ui.with_layout(layout, |ui| {
+                ui.set_row_height(ui.text_style_height(&TextStyle::Body));
                 while let Some((_, (e, src_span))) = events_iter.next() {
                     self.process_event(
                         ui,

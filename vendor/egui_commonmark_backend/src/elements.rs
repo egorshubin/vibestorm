@@ -21,43 +21,36 @@ pub fn newline(ui: &mut Ui) {
     ui.label("\n");
 }
 
+// VibeStorm: list markers are labels, not shapes painted into a box, so they follow the
+// text's vertical alignment (`override_text_valign`) and share the item's baseline.
+
+/// A marker label inside the 4-space marker column; `centre` centres it, else right-aligns it.
+fn marker(ui: &mut Ui, text: &str, centre: bool) {
+    let col = width_body_space(ui) * 4.0;
+    let rt = RichText::new(text).color(ui.visuals().strong_text_color());
+    let w = WidgetText::from(rt.clone())
+        .into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, TextStyle::Body)
+        .size()
+        .x;
+    let gap = ui.spacing().item_spacing.x;
+    let pad = (col - w - gap).max(0.0);
+    ui.add_space(if centre { pad / 2.0 } else { pad });
+    ui.add(egui::Label::new(rt).wrap_mode(egui::TextWrapMode::Extend).selectable(false));
+    if centre {
+        ui.add_space(pad / 2.0);
+    }
+}
+
 pub fn bullet_point(ui: &mut Ui) {
-    let (rect, _) = ui.allocate_exact_size(
-        egui::vec2(width_body_space(ui) * 4.0, height_body(ui)),
-        Sense::hover(),
-    );
-    ui.painter().circle_filled(
-        rect.center(),
-        rect.height() / 6.0,
-        ui.visuals().strong_text_color(),
-    );
+    marker(ui, "•", true);
 }
 
 pub fn bullet_point_hollow(ui: &mut Ui) {
-    let (rect, _) = ui.allocate_exact_size(
-        egui::vec2(width_body_space(ui) * 4.0, height_body(ui)),
-        Sense::hover(),
-    );
-    ui.painter().circle(
-        rect.center(),
-        rect.height() / 6.0,
-        egui::Color32::TRANSPARENT,
-        egui::Stroke::new(0.6, ui.visuals().strong_text_color()),
-    );
+    marker(ui, "◦", true);
 }
 
 pub fn number_point(ui: &mut Ui, number: &str) {
-    let (rect, _) = ui.allocate_exact_size(
-        egui::vec2(width_body_space(ui) * 4.0, height_body(ui)),
-        Sense::hover(),
-    );
-    ui.painter().text(
-        rect.right_center(),
-        egui::Align2::RIGHT_CENTER,
-        format!("{number}."),
-        TextStyle::Body.resolve(ui.style()),
-        ui.visuals().strong_text_color(),
-    );
+    marker(ui, &format!("{number}."), false);
 }
 
 #[inline]
