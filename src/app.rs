@@ -1150,12 +1150,36 @@ impl IdeApp {
 
     fn tabs_bar(&mut self, ui: &mut Ui, pal: &Palette, acts: &mut Vec<Action>) {
         let Some(p) = self.projects.get_mut(self.active) else { return };
+        let font = FontId::proportional(13.0);
+        // natural width of every tab (chats, then files), shrunk together to fit the bar
+        let text_w = |ui: &Ui, s: &str| ui.fonts_mut(|f| f.layout_no_wrap(s.to_owned(), font.clone(), pal.text).size().x);
+        let chat_labels: Vec<String> = p
+            .chats
+            .iter()
+            .map(|c| c.title().as_deref().map(|t| util::truncate(t, 28)).unwrap_or_else(|| "New session".into()))
+            .collect();
+        let chat_pad = |c: &Chat| if c.pending_approvals() > 0 || c.busy || c.unseen { 80.0 } else { 62.0 };
+        let mut widths: Vec<f32> = p
+            .chats
+            .iter()
+            .zip(&chat_labels)
+            .map(|(c, l)| text_w(ui, l) + chat_pad(c))
+            .chain(p.docs.iter().map(|d| text_w(ui, &d.title) + 62.0))
+            .collect();
+        fit_tabs(&mut widths, ui.available_width(), 96.0);
+        // text cut to what's left of the tab after icon, marks and close button
+        let tab_text = |ui: &Ui, s: &str, color: Color32, max_w: f32| {
+            let mut job = egui::text::LayoutJob::simple_singleline(s.to_owned(), font.clone(), color);
+            job.wrap = egui::text::TextWrapping::truncate_at_width(max_w.max(12.0));
+            ui.fonts_mut(|f| f.layout_job(job))
+        };
         egui::ScrollArea::horizontal()
             .id_salt("tabs")
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
+                    let mut widths = widths.into_iter();
                     // Claude Code tabs, one per conversation, before the files
                     for (i, c) in p.chats.iter().enumerate() {
                         let active = p.active_doc.is_none() && p.active_chat == i;
@@ -1169,10 +1193,8 @@ impl IdeApp {
                             ("", pal.text_weak)
                         };
                         let title = c.title();
-                        let label = title.as_deref().map(|t| util::truncate(t, 28)).unwrap_or_else(|| "New session".into());
-                        let font = FontId::proportional(13.0);
-                        let tw = ui.fonts_mut(|f| f.layout_no_wrap(label.clone(), font.clone(), pal.text).size().x);
-                        let w = tw + if mark.is_empty() { 62.0 } else { 80.0 };
+                        let w = widths.next().unwrap_or(96.0);
+                        let label = tab_text(ui, &chat_labels[i], pal.text, w - chat_pad(c));
                         let (rect, resp) = ui.allocate_exact_size(vec2(w, 32.0), Sense::click());
                         let painter = ui.painter();
                         if active {
@@ -1182,7 +1204,7 @@ impl IdeApp {
                             painter.rect_filled(rect, 0.0, pal.hover);
                         }
                         painter.text(pos2(rect.min.x + 18.0, rect.center().y), Align2::CENTER_CENTER, "✻", FontId::proportional(15.0), claude_ui::CLAUDE);
-                        painter.text(pos2(rect.min.x + 32.0, rect.center().y), Align2::LEFT_CENTER, &label, font, pal.text);
+                        painter.galley(pos2(rect.min.x + 32.0, rect.center().y - label.size().y / 2.0), label, pal.text);
                         if !mark.is_empty() {
                             painter.text(pos2(rect.max.x - 32.0, rect.center().y), Align2::CENTER_CENTER, mark, FontId::proportional(12.0), mcol);
                         }
@@ -1225,9 +1247,8 @@ impl IdeApp {
                             .get(&util::rel_path(&p.root, &d.path))
                             .map(|s| s.color(pal))
                             .unwrap_or(pal.text);
-                        let font = FontId::proportional(13.0);
-                        let tw = ui.fonts_mut(|f| f.layout_no_wrap(d.title.clone(), font.clone(), name_col).size().x);
-                        let w = tw + 62.0;
+                        let w = widths.next().unwrap_or(96.0);
+                        let label = tab_text(ui, &d.title, name_col, w - 62.0);
                         let (rect, resp) = ui.allocate_exact_size(vec2(w, 32.0), Sense::click());
                         let painter = ui.painter();
                         if active {
@@ -1244,7 +1265,7 @@ impl IdeApp {
                         let br = egui::Rect::from_min_size(pos2(rect.min.x + 10.0, rect.center().y - 7.0), vec2(16.0, 14.0));
                         painter.rect_filled(br, 3.0, bcol);
                         painter.text(br.center(), Align2::CENTER_CENTER, badge, FontId::proportional(9.5), Color32::WHITE);
-                        painter.text(pos2(br.max.x + 6.0, rect.center().y), Align2::LEFT_CENTER, &d.title, font, name_col);
+                        painter.galley(pos2(br.max.x + 6.0, rect.center().y - label.size().y / 2.0), label, name_col);
                         let close_r = egui::Rect::from_center_size(pos2(rect.max.x - 14.0, rect.center().y), vec2(16.0, 16.0));
                         let close_hover = ui.rect_contains_pointer(close_r);
                         if d.dirty && !close_hover {
@@ -2199,6 +2220,29 @@ enum RowClick {
     Git,
     Unload,
     Menu(egui::Response),
+}
+
+/// Shrink tab widths to fit `avail`, browser-style: the widest tabs are capped first and
+/// narrow ones keep their size, but none goes below `min` (past that the bar scrolls).
+fn fit_tabs(widths: &mut [f32], avail: f32, min: f32) {
+    if widths.iter().sum::<f32>() <= avail {
+        return;
+    }
+    let mut sorted = widths.to_vec();
+    sorted.sort_by(f32::total_cmp);
+    let mut left = avail;
+    let mut cap = min;
+    for (k, &w) in sorted.iter().enumerate() {
+        let rest = (sorted.len() - k) as f32;
+        if w * rest > left {
+            cap = left / rest;
+            break;
+        }
+        left -= w;
+    }
+    for w in widths {
+        *w = w.min(cap.max(min));
+    }
 }
 
 /// Paint a folder glyph centred in `r`. Lit = bright front flap.

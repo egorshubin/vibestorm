@@ -976,7 +976,7 @@ mod tests {
             let mut input = egui::RawInput::default();
             input.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(420.0, 400.0)));
             input.viewports.entry(egui::ViewportId::ROOT).or_default().native_pixels_per_point = Some(ppp);
-            let md = "To fix it:\n\n1. In Chrome, check the extension.\n2. In Claude Code, see `/mcp` or `/chrome` here.\n\n- Bullet one\n- Bullet `two`\n";
+            let md = "To fix it:\n\n1. In Chrome, check the extension.\n2. In Claude Code, see `/mcp` or `/chrome` here.\n\n- Bullet one\n- Bullet `two`\n\nVerified:\n\n- Wrapped item that is long enough to run onto a second and maybe a third line of text here.\n- Another wrapped item with `code` in it, also long enough to wrap onto the next line.\n";
             let mut out = None;
             for _ in 0..3 {
                 let mut o = ctx.run_ui(input.clone(), |ui| markdown(ui, &mut cache, md));
@@ -997,6 +997,9 @@ mod tests {
             for m in ["1.", "2.", "•"] {
                 let marks: Vec<_> = runs.iter().filter(|r| r.0 == m).collect();
                 assert!(!marks.is_empty(), "ppp {ppp}: no {m} in {runs:?}");
+                if m == "•" {
+                    assert_eq!(marks.len(), 4, "ppp {ppp}: {runs:?}");
+                }
                 for (_, x, b) in marks {
                     // the item's text: the next run on the right, on the same baseline
                     assert!(
