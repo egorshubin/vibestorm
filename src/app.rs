@@ -339,7 +339,7 @@ struct InAppToast {
     at: std::time::Instant,
 }
 
-fn setup_fonts(ctx: &egui::Context) {
+pub(crate) fn setup_fonts(ctx: &egui::Context) {
     use egui::{FontData, FontFamily, epaint::text::{FontInsert, FontPriority, InsertFontFamily}};
     let win = PathBuf::from(std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into())).join("Fonts");
     let local = std::env::var_os("LOCALAPPDATA")
@@ -355,51 +355,19 @@ fn setup_fonts(ctx: &egui::Context) {
         None
     };
     let fam = |f: FontFamily, p: FontPriority| InsertFontFamily { family: f, priority: p };
-    let md_code = || FontFamily::Name(theme::MD_CODE_FAMILY.into());
-    let mut text_below = None;
     if let Some((n, b)) = read(&["segoeui.ttf"]) {
-        text_below = below_baseline_em(&b);
         ctx.add_font(FontInsert::new(&n, FontData::from_owned(b), vec![fam(FontFamily::Proportional, FontPriority::Highest)]));
     }
     if let Some((n, b)) = read(&["JetBrainsMono-Regular.ttf", "CascadiaMono.ttf", "CascadiaCode.ttf", "consola.ttf"]) {
-        // Inline code in markdown sits in the same row as Segoe UI text, bottom-aligned.
-        // egui ends a row at descent + line gap below the baseline, and Consolas has a
-        // big line gap (Segoe UI none), so its baseline would float ~0.17em too high:
-        // a copy shifted down by the difference puts both on one baseline.
-        if let (Some(t), Some(m)) = (text_below, below_baseline_em(&b)) {
-            let tweak = egui::FontTweak { y_offset_factor: m - t, ..Default::default() };
-            let data = FontData::from_owned(b.clone()).tweak(tweak);
-            ctx.add_font(FontInsert::new(&format!("{n} (md code)"), data, vec![fam(md_code(), FontPriority::Highest)]));
-            theme::MD_CODE_FONT.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
         ctx.add_font(FontInsert::new(&n, FontData::from_owned(b), vec![fam(FontFamily::Monospace, FontPriority::Highest)]));
     }
     if let Some((n, b)) = read(&["seguisym.ttf"]) {
-        let mut families = vec![fam(FontFamily::Proportional, FontPriority::Lowest), fam(FontFamily::Monospace, FontPriority::Lowest)];
-        if theme::MD_CODE_FONT.load(std::sync::atomic::Ordering::Relaxed) {
-            families.push(fam(md_code(), FontPriority::Lowest));
-        }
-        ctx.add_font(FontInsert::new(&n, FontData::from_owned(b), families));
+        ctx.add_font(FontInsert::new(
+            &n,
+            FontData::from_owned(b),
+            vec![fam(FontFamily::Proportional, FontPriority::Lowest), fam(FontFamily::Monospace, FontPriority::Lowest)],
+        ));
     }
-}
-
-/// (descent + line gap) / units-per-em from a TrueType font's `head` and `hhea` tables:
-/// how far below the baseline egui ends a text row of this font, in font sizes.
-fn below_baseline_em(font: &[u8]) -> Option<f32> {
-    let u16_at = |o: usize| font.get(o..o + 2).map(|b| u16::from_be_bytes([b[0], b[1]]));
-    let i16_at = |o: usize| u16_at(o).map(|v| v as i16);
-    let u32_at = |o: usize| font.get(o..o + 4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
-    let table = |tag: &[u8]| {
-        (0..u16_at(4)? as usize)
-            .map(|i| 12 + 16 * i)
-            .find(|&r| font.get(r..r + 4) == Some(tag))
-            .and_then(|r| u32_at(r + 8))
-            .map(|o| o as usize)
-    };
-    let upm = u16_at(table(b"head")? + 18)? as f32;
-    let hhea = table(b"hhea")?;
-    let (descender, line_gap) = (i16_at(hhea + 6)? as f32, i16_at(hhea + 8)? as f32);
-    (upm > 0.0).then(|| (line_gap - descender) / upm)
 }
 
 impl IdeApp {

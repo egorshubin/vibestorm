@@ -27,7 +27,7 @@ pub use {
 
 // The only structs that may be used directly. (If one does not need egui_commonmark)
 pub use misc::CommonMarkCache;
-pub use misc::set_inline_code_style;
+pub use misc::{set_inline_code_style, text_label};
 #[cfg(feature = "regex")]
 pub use misc::SearchOptions;
 

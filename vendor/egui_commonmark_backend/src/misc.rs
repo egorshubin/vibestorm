@@ -236,16 +236,19 @@ impl Style {
         }
 
         if self.code {
-            // VibeStorm patch: inline code gets its own colour and background,
-            // set by the app through `set_inline_code_style`.
-            let style = ui
-                .data(|d| d.get_temp::<InlineCodeStyle>(Id::new(INLINE_CODE_STYLE_ID)));
-            text = match style {
-                Some(s) => text
-                    .monospace()
-                    .family(s.family)
-                    .color(s.fg)
-                    .background_color(s.bg),
+            // VibeStorm patch: inline code gets its own colour (set by the app through
+            // `set_inline_code_style`) and sits on the body text's baseline; `text_label`
+            // puts it on a chip.
+            text = match inline_code_style(ui) {
+                Some(s) => {
+                    let text = text.monospace().color(s.fg);
+                    if self.heading.is_none() {
+                        let text = text.font(code_font(ui));
+                        text.line_height(Some(TextMetrics::of(ui).code_line_height()))
+                    } else {
+                        text
+                    }
+                }
                 None => text.code(),
             };
         }
@@ -256,23 +259,111 @@ impl Style {
 
 const INLINE_CODE_STYLE_ID: &str = "vibestorm_inline_code_style";
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct InlineCodeStyle {
-    family: egui::FontFamily,
     fg: egui::Color32,
     bg: egui::Color32,
 }
 
-/// VibeStorm patch: font family, text and background colours for inline `code` spans
-/// (instead of egui's monospace font with `code_bg_color` and the regular text colour).
-pub fn set_inline_code_style(
-    ctx: &egui::Context,
-    family: egui::FontFamily,
-    fg: egui::Color32,
-    bg: egui::Color32,
-) {
-    let style = InlineCodeStyle { family, fg, bg };
+fn inline_code_style(ui: &Ui) -> Option<InlineCodeStyle> {
+    ui.data(|d| d.get_temp::<InlineCodeStyle>(Id::new(INLINE_CODE_STYLE_ID)))
+}
+
+/// VibeStorm patch: text and chip colours for inline `code` spans
+/// (instead of egui's `code_bg_color` behind the regular text colour).
+pub fn set_inline_code_style(ctx: &egui::Context, fg: egui::Color32, bg: egui::Color32) {
+    let style = InlineCodeStyle { fg, bg };
     ctx.data_mut(|d| d.insert_temp(Id::new(INLINE_CODE_STYLE_ID), style));
+}
+
+/// Inline code is a bit smaller than the text around it, like in VS Code.
+const INLINE_CODE_SCALE: f32 = 0.88;
+
+fn code_font(ui: &Ui) -> egui::FontId {
+    let mono = TextStyle::Monospace.resolve(ui.style());
+    egui::FontId::new(mono.size * INLINE_CODE_SCALE, mono.family)
+}
+
+/// Vertical metrics (points) of the body font and the inline code font.
+struct TextMetrics {
+    body_ascent: f32,
+    body_height: f32,
+    code_ascent: f32,
+    code_height: f32,
+}
+
+impl TextMetrics {
+    fn of(ui: &Ui) -> Self {
+        let measure = |font: egui::FontId| {
+            let g = egui::WidgetText::from(RichText::new("x").font(font)).into_galley(
+                ui,
+                Some(egui::TextWrapMode::Extend),
+                f32::INFINITY,
+                TextStyle::Body,
+            );
+            g.rows[0]
+                .row
+                .glyphs
+                .first()
+                .map_or((g.size().y * 0.8, g.size().y), |g| (g.font_ascent, g.font_height))
+        };
+        let (body_ascent, body_height) = measure(TextStyle::Body.resolve(ui.style()));
+        let (code_ascent, code_height) = measure(code_font(ui));
+        TextMetrics { body_ascent, body_height, code_ascent, code_height }
+    }
+
+    /// In a bottom-aligned row of height H, body text has its baseline at
+    /// `body_ascent + H - body_height`, and a glyph with an explicit line height L at
+    /// `code_ascent + H - (L + code_height) / 2`. This L makes the two equal, so the
+    /// monospace font (whose line gap would otherwise lift it, e.g. Consolas) shares
+    /// the body baseline, rounded to pixels the same way.
+    fn code_line_height(&self) -> f32 {
+        2.0 * (self.code_ascent - self.body_ascent + self.body_height) - self.code_height
+    }
+}
+
+/// VibeStorm patch: a run of paragraph text. Inline code (with an app style) sits on a
+/// rounded chip that hugs its glyphs: egui's own text background spans the font's line
+/// box, which for a font with a line gap (Consolas) leaves far more room above the
+/// letters than below. A span that doesn't fit the rest of the row starts a new row
+/// instead of breaking in the middle.
+///
+/// Expects bottom-aligned rows (`Style::override_text_valign = Some(Align::BOTTOM)`):
+/// then every label in a row shares the body font's baseline.
+pub fn text_label(ui: &mut Ui, text: RichText, code: bool) -> egui::Response {
+    let Some(style) = code.then(|| inline_code_style(ui)).flatten() else {
+        return ui.label(text);
+    };
+    const PAD: f32 = 3.0;
+    let m = TextMetrics::of(ui);
+    let width = egui::WidgetText::from(text.clone())
+        .into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, TextStyle::Body)
+        .size()
+        .x
+        + 2.0 * PAD;
+    if width > ui.available_width() {
+        return ui.label(text.background_color(style.bg));
+    }
+    if width > ui.available_size_before_wrap().x {
+        ui.end_row();
+    }
+    let chip = ui.painter().add(egui::Shape::Noop);
+    // the left padding, as tall as a body text line: the row is then at least that
+    // tall, as `code_line_height` assumes
+    ui.allocate_space(egui::vec2(PAD, m.body_height));
+    let resp = ui.label(text);
+    ui.add_space(PAD);
+
+    let ppp = ui.ctx().pixels_per_point();
+    let base = resp.rect.top()
+        + ((m.body_ascent + resp.rect.height() - m.body_height) * ppp).round() / ppp;
+    let size = code_font(ui).size;
+    let rect = egui::Rect::from_x_y_ranges(
+        resp.rect.left() - PAD..=resp.rect.right() + PAD,
+        base - 0.82 * size..=base + 0.40 * size,
+    );
+    ui.painter().set(chip, egui::Shape::rect_filled(rect, 4.0, style.bg));
+    resp
 }
 
 #[derive(Default)]

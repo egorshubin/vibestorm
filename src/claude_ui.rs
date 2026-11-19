@@ -94,6 +94,14 @@ fn markdown(ui: &mut Ui, cache: &mut egui_commonmark::CommonMarkCache, text: &st
     });
 }
 
+/// Y of the first text line's baseline within a galley.
+fn first_baseline(g: &egui::Galley) -> f32 {
+    g.rows
+        .first()
+        .and_then(|r| r.row.glyphs.first().map(|gl| r.pos.y + gl.pos.y))
+        .unwrap_or(g.size().y * 0.8)
+}
+
 /// Line diff by trimming the common head/tail (good enough for Edit tool hunks).
 fn diff_lines<'a>(old: &'a str, new: &'a str) -> Vec<(char, &'a str)> {
     let a: Vec<&str> = old.lines().collect();
@@ -535,16 +543,16 @@ pub fn show(
                                 }
                                 let x = rect.min.x + 4.0 + indent;
                                 p.circle_filled(pos2(x + 4.0, rect.center().y), 3.5, col);
+                                // the name is centred; the command sits on its baseline (centring
+                                // each font's own box would lift the monospace one)
+                                let ppp = ui.ctx().pixels_per_point();
+                                let snap = |v: f32| (v * ppp).round() / ppp;
                                 let ng = p.layout_no_wrap(name.clone(), FontId::proportional(13.0), pal.text);
-                                let nw = ng.size().x;
-                                p.galley(pos2(x + 14.0, rect.center().y - ng.size().y / 2.0), ng, pal.text);
-                                p.text(
-                                    pos2(x + 22.0 + nw, rect.center().y),
-                                    Align2::LEFT_CENTER,
-                                    &summary,
-                                    FontId::monospace(11.5),
-                                    pal.text_weak,
-                                );
+                                let sg = p.layout_no_wrap(summary.clone(), FontId::monospace(11.5), pal.text_weak);
+                                let (nw, name_top) = (ng.size().x, snap(rect.center().y - ng.size().y / 2.0));
+                                let base = name_top + first_baseline(&ng);
+                                p.galley(pos2(x + 14.0, name_top), ng, pal.text);
+                                p.galley(pos2(x + 22.0 + nw, snap(base - first_baseline(&sg))), sg, pal.text_weak);
                                 let file = claude::tool_file_path(name, input);
                                 let hover = if file.is_some() { "Click: details · double-click: open file" } else { "Click: details" };
                                 let resp = resp.on_hover_text(hover);
@@ -731,4 +739,56 @@ pub fn show(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Inline `code` must sit exactly on the body text's baseline, its chip around it.
+    #[test]
+    fn inline_code_on_text_baseline() {
+        for ppp in [1.0f32, 1.25, 1.5, 2.0] {
+            let ctx = egui::Context::default();
+            crate::app::setup_fonts(&ctx);
+            crate::theme::apply(&ctx, true, 14.0);
+            let mut cache = egui_commonmark::CommonMarkCache::default();
+            let mut input = egui::RawInput::default();
+            input.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(420.0, 400.0)));
+            input.viewports.entry(egui::ViewportId::ROOT).or_default().native_pixels_per_point = Some(ppp);
+            let md = "Код в `tall_file_dialog()` в `src/util.rs`, для этого включил в `Cargo.toml` две фичи windows-sys, и ещё немного текста.";
+            let mut out = None;
+            for _ in 0..3 {
+                let mut o = ctx.run_ui(input.clone(), |ui| markdown(ui, &mut cache, md));
+                o.textures_delta.clear();
+                out = Some(o);
+            }
+            // (is code, baseline) of every glyph; chips by their corner radius
+            let (mut glyphs, mut chips) = (vec![], vec![]);
+            for cs in &out.unwrap().shapes {
+                match &cs.shape {
+                    egui::Shape::Text(t) => {
+                        for r in &t.galley.rows {
+                            for g in r.row.glyphs.iter().filter(|g| !g.chr.is_whitespace()) {
+                                // at 14 pt Segoe UI's ascent is 15.1, Consolas' 10.4
+                                let code = g.font_ascent < 12.5;
+                                glyphs.push((code, t.pos.y + r.pos.y + g.pos.y));
+                            }
+                        }
+                    }
+                    egui::Shape::Rect(r) if r.corner_radius.nw == 4 => chips.push(r.rect),
+                    _ => {}
+                }
+            }
+            let text: Vec<f32> = glyphs.iter().filter(|g| !g.0).map(|g| g.1).collect();
+            let code: Vec<f32> = glyphs.iter().filter(|g| g.0).map(|g| g.1).collect();
+            assert!(!code.is_empty() && chips.len() == 3, "ppp {ppp}: {} code glyphs, {} chips", code.len(), chips.len());
+            for b in &code {
+                assert!(text.iter().any(|t| (t - b).abs() < 0.01), "ppp {ppp}: code baseline {b} not in text baselines {text:?}");
+                let chip = chips.iter().find(|c| c.y_range().contains(*b)).expect("code glyph without chip");
+                let (above, below) = (b - chip.min.y, chip.max.y - b);
+                assert!(above > below && below > 3.0, "ppp {ppp}: chip {above} above / {below} below the baseline");
+            }
+        }
+    }
 }

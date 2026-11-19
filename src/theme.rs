@@ -2,12 +2,6 @@
 
 use eframe::egui::{self, Color32, CornerRadius, FontFamily, FontId, Stroke, TextStyle, Theme, Visuals, vec2};
 
-/// Font family for inline `code` in Claude's markdown: the monospace font shifted
-/// onto Segoe UI's baseline (registered by `app::setup_fonts`, see there).
-pub const MD_CODE_FAMILY: &str = "md_code";
-/// Set once `MD_CODE_FAMILY` has a font; until then inline code uses plain Monospace.
-pub static MD_CODE_FONT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 pub const fn hex(c: u32) -> Color32 {
     Color32::from_rgb((c >> 16) as u8, (c >> 8) as u8, c as u8)
 }
@@ -142,12 +136,7 @@ pub fn apply(ctx: &egui::Context, dark: bool, ui_size: f32) {
     } else {
         (hex(0xB4532A), Color32::from_black_alpha(16))
     };
-    let code_family = if MD_CODE_FONT.load(std::sync::atomic::Ordering::Relaxed) {
-        FontFamily::Name(MD_CODE_FAMILY.into())
-    } else {
-        FontFamily::Monospace
-    };
-    egui_commonmark_backend::set_inline_code_style(ctx, code_family, code_fg, code_bg);
+    egui_commonmark_backend::set_inline_code_style(ctx, code_fg, code_bg);
     v.window_stroke = Stroke::new(1.0, p.border);
     v.selection.bg_fill = p.selection;
     v.selection.stroke = Stroke::new(1.0, p.text);

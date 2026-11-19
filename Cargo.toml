@@ -23,7 +23,8 @@ tauri-winrt-notification = "0.8"
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi"] }
 
 [patch.crates-io]
-# Inline `code` in Claude's replies: own text colour + background (misc.rs, "VibeStorm patch")
+# Inline `code` in Claude's replies: own font, colour and chip (search for "VibeStorm patch")
+egui_commonmark = { path = "vendor/egui_commonmark" }
 egui_commonmark_backend = { path = "vendor/egui_commonmark_backend" }
 
 [profile.release]
