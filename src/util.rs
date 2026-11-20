@@ -143,7 +143,11 @@ pub fn fmt_duration(secs: u64) -> String {
 /// Procedurally drawn window icon (no asset files needed): a pink lotus on a lily pad,
 /// on a deep teal rounded square. Shapes are laid out on a 64×64 grid.
 pub fn app_icon() -> egui::IconData {
-    let s = 128usize;
+    app_icon_sized(128)
+}
+
+/// The app icon rendered at `s`×`s` pixels.
+pub fn app_icon_sized(s: usize) -> egui::IconData {
     const SS: usize = 4; // samples per pixel and axis, for smooth edges
     // (angle from vertical in degrees, length, half width), drawn back to front
     const PETALS: [(f32, f32, f32); 5] = [(-64.0, 23.0, 7.0), (64.0, 23.0, 7.0), (-31.0, 29.0, 8.0), (31.0, 29.0, 8.0), (0.0, 34.0, 9.0)];
@@ -297,9 +301,19 @@ pub fn tall_file_dialog() {
 #[cfg(not(windows))]
 pub fn tall_file_dialog() {}
 
-/// Write the app icon as a .ico file (used for desktop / Start menu shortcuts).
+/// Write the app icon as a multi-size .ico file. `vibezen.ico` in the repo comes from here
+/// (`vibezen.exe --write-icon vibezen.ico`); build.rs embeds it into the exe, which is
+/// where the taskbar, pinned shortcuts and Explorer take the icon from.
 pub fn write_icon(path: &Path) -> Result<(), String> {
-    let ic = app_icon();
-    let img = image::RgbaImage::from_raw(ic.width, ic.height, ic.rgba).ok_or("bad icon")?;
-    img.save_with_format(path, image::ImageFormat::Ico).map_err(|e| e.to_string())
+    use image::codecs::ico::{IcoEncoder, IcoFrame};
+    let frames = [16, 20, 24, 32, 40, 48, 64, 128, 256]
+        .into_iter()
+        .map(|s| {
+            let ic = app_icon_sized(s);
+            IcoFrame::as_png(&ic.rgba, ic.width, ic.height, image::ExtendedColorType::Rgba8)
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    let f = std::fs::File::create(path).map_err(|e| e.to_string())?;
+    IcoEncoder::new(f).encode_images(&frames).map_err(|e| e.to_string())
 }

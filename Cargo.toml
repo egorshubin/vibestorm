@@ -25,6 +25,10 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Globali
 zip = { version = "9.8", default-features = false, features = ["deflate-flate2"] }
 quick-xml = "0.41"
 
+[build-dependencies]
+# App icon in the exe (see build.rs)
+winresource = "0.1"
+
 [patch.crates-io]
 # Inline `code` in Claude's replies: own font, colour and chip (search for "VibeZen patch")
 egui_commonmark = { path = "vendor/egui_commonmark" }
