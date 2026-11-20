@@ -119,7 +119,7 @@ fn fetch() -> Result<Vec<RateLimit>, FetchError> {
     // so it never shows up in a process command line.
     let mut child = crate::util::hidden_cmd("curl")
         .args(["-sS", "--max-time", "20", "-H", "@-", "-H", "anthropic-beta: oauth-2025-04-20", "-H", "Accept: application/json"])
-        .args(["-A", concat!("vibestorm/", env!("CARGO_PKG_VERSION")), "-w", "\n%{http_code}", URL])
+        .args(["-A", concat!("vibezen/", env!("CARGO_PKG_VERSION")), "-w", "\n%{http_code}", URL])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

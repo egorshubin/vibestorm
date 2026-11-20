@@ -21,7 +21,7 @@ pub fn newline(ui: &mut Ui) {
     ui.label("\n");
 }
 
-// VibeStorm: list markers are labels, not shapes painted into a box, so they follow the
+// VibeZen: list markers are labels, not shapes painted into a box, so they follow the
 // text's vertical alignment (`override_text_valign`) and share the item's baseline.
 
 /// A marker label inside the 4-space marker column; `centre` centres it, else right-aligns it.

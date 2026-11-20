@@ -135,7 +135,7 @@ impl Doc {
 
     pub fn virtual_doc(title: &str, key: &str, text: String) -> Doc {
         Doc {
-            path: PathBuf::from(format!("vibestorm://{key}")),
+            path: PathBuf::from(format!("vibezen://{key}")),
             title: title.to_owned(),
             kind: DocKind::Diff,
             saved_hash: 0,

@@ -20,19 +20,19 @@ pub fn hidden_cmd(program: &str) -> Command {
 }
 
 /// Windows toast notification (fire and forget, off the UI thread).
-pub const AUMID: &str = "VibeStorm";
+pub const AUMID: &str = "VibeZen";
 
-/// Register "VibeStorm" as a toast sender (HKCU\Software\Classes\AppUserModelId),
+/// Register "VibeZen" as a toast sender (HKCU\Software\Classes\AppUserModelId),
 /// so notifications show our name and icon instead of "Windows PowerShell".
 fn ensure_aumid() -> bool {
     static DONE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *DONE.get_or_init(|| {
         let dir = match std::env::var_os("APPDATA") {
-            Some(d) => PathBuf::from(d).join("VibeStorm"),
+            Some(d) => PathBuf::from(d).join("VibeZen"),
             None => return false,
         };
         let _ = std::fs::create_dir_all(&dir);
-        let icon = dir.join("vibestorm.png");
+        let icon = dir.join("vibezen.png");
         if !icon.exists() {
             let ic = app_icon();
             if let Some(img) = image::RgbaImage::from_raw(ic.width, ic.height, ic.rgba) {
@@ -41,7 +41,7 @@ fn ensure_aumid() -> bool {
         }
         let key = format!(r"HKCU\Software\Classes\AppUserModelId\{AUMID}");
         let ok1 = hidden_cmd("reg")
-            .args(["add", &key, "/v", "DisplayName", "/t", "REG_SZ", "/d", "VibeStorm", "/f"])
+            .args(["add", &key, "/v", "DisplayName", "/t", "REG_SZ", "/d", "VibeZen", "/f"])
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false);
@@ -140,43 +140,68 @@ pub fn fmt_duration(secs: u64) -> String {
     }
 }
 
-/// Procedurally drawn window icon (no asset files needed).
+/// Procedurally drawn window icon (no asset files needed): a pink lotus on a lily pad,
+/// on a deep teal rounded square. Shapes are laid out on a 64×64 grid.
 pub fn app_icon() -> egui::IconData {
-    let s = 64usize;
-    let mut rgba = vec![0u8; s * s * 4];
-    let r = 14.0f32;
-    for y in 0..s {
-        for x in 0..s {
-            let fx = x as f32 + 0.5;
-            let fy = y as f32 + 0.5;
-            let sz = s as f32;
-            // rounded-square mask
-            let cx = fx.clamp(r, sz - r);
-            let cy = fy.clamp(r, sz - r);
-            let d = ((fx - cx).powi(2) + (fy - cy).powi(2)).sqrt();
-            if d > r {
+    let s = 128usize;
+    const SS: usize = 4; // samples per pixel and axis, for smooth edges
+    // (angle from vertical in degrees, length, half width), drawn back to front
+    const PETALS: [(f32, f32, f32); 5] = [(-64.0, 23.0, 7.0), (64.0, 23.0, 7.0), (-31.0, 29.0, 8.0), (31.0, 29.0, 8.0), (0.0, 34.0, 9.0)];
+    const BASE: (f32, f32) = (32.0, 45.0);
+    let lerp = |a: [f32; 3], b: [f32; 3], t: f32| [0, 1, 2].map(|i| a[i] + (b[i] - a[i]) * t);
+    let sample = |fx: f32, fy: f32| -> Option<[f32; 3]> {
+        // rounded-square mask
+        let r = 14.0;
+        let (cx, cy) = (fx.clamp(r, 64.0 - r), fy.clamp(r, 64.0 - r));
+        if (fx - cx).powi(2) + (fy - cy).powi(2) > r * r {
+            return None;
+        }
+        let mut px = lerp([30.0, 52.0, 100.0], [14.0, 108.0, 116.0], fy / 64.0);
+        // lily pad
+        let (lx, ly) = ((fx - 32.0) / 25.0, (fy - 49.0) / 6.0);
+        if lx * lx + ly * ly <= 1.0 {
+            px = lerp([110.0, 205.0, 140.0], [40.0, 140.0, 100.0], (ly + 1.0) / 2.0);
+        }
+        for (deg, len, half) in PETALS {
+            let a = deg.to_radians();
+            let (dx, dy) = (fx - BASE.0, fy - BASE.1);
+            let u = dx * a.sin() - dy * a.cos(); // along the petal, base to tip
+            let v = dx * a.cos() + dy * a.sin(); // across it
+            let t = u / len;
+            if !(0.0..1.0).contains(&t) {
                 continue;
             }
-            let t = (fx + fy) / (2.0 * sz);
-            let lerp = |a: f32, b: f32| (a + (b - a) * t) as u8;
-            let mut px = [lerp(53.0, 150.0), lerp(116.0, 80.0), lerp(240.0, 230.0), 255];
-            // lightning bolt
-            const BOLT: [(f32, f32); 7] = [(38.0, 6.0), (15.0, 37.0), (29.0, 37.0), (24.0, 59.0), (49.0, 25.0), (34.0, 25.0), (42.0, 6.0)];
-            let mut inside = false;
-            let mut j = BOLT.len() - 1;
-            for i in 0..BOLT.len() {
-                let (xi, yi) = BOLT[i];
-                let (xj, yj) = BOLT[j];
-                if (yi > fy) != (yj > fy) && fx < (xj - xi) * (fy - yi) / (yj - yi) + xi {
-                    inside = !inside;
+            // pointed at both ends, widest a bit below the middle
+            let w = half * (std::f32::consts::PI * t.powf(0.85)).sin();
+            if v.abs() < w {
+                let c = lerp([214.0, 64.0, 136.0], [255.0, 200.0, 226.0], t);
+                // darker towards the rim, so overlapping petals stay apart
+                let e = 1.0 - 0.3 * (v.abs() / w).powi(3);
+                px = c.map(|x| x * e);
+            }
+        }
+        Some(px)
+    };
+    let mut rgba = vec![0u8; s * s * 4];
+    let k = 64.0 / s as f32;
+    for y in 0..s {
+        for x in 0..s {
+            let (mut sum, mut hits) = ([0.0f32; 3], 0);
+            for sy in 0..SS {
+                for sx in 0..SS {
+                    let fx = (x as f32 + (sx as f32 + 0.5) / SS as f32) * k;
+                    let fy = (y as f32 + (sy as f32 + 0.5) / SS as f32) * k;
+                    if let Some(c) = sample(fx, fy) {
+                        (0..3).for_each(|i| sum[i] += c[i]);
+                        hits += 1;
+                    }
                 }
-                j = i;
             }
-            if inside {
-                px = [255, 236, 120, 255];
+            if hits > 0 {
+                let i = (y * s + x) * 4;
+                let c = sum.map(|v| (v / hits as f32) as u8);
+                rgba[i..i + 4].copy_from_slice(&[c[0], c[1], c[2], (hits * 255 / (SS * SS)) as u8]);
             }
-            let i = (y * s + x) * 4;
-            rgba[i..i + 4].copy_from_slice(&px);
         }
     }
     egui::IconData {
@@ -186,7 +211,7 @@ pub fn app_icon() -> egui::IconData {
     }
 }
 
-/// Put a child process into a job that is killed when VibeStorm exits (even on crash),
+/// Put a child process into a job that is killed when VibeZen exits (even on crash),
 /// so Claude agents never outlive the IDE.
 #[cfg(windows)]
 pub fn kill_with_ide(child: &std::process::Child) {

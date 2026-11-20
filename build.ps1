@@ -1,14 +1,14 @@
-# Build VibeStorm even while it is running.
-# Windows locks a running exe, but allows renaming it: every locked vibestorm*.exe
+# Build VibeZen even while it is running.
+# Windows locks a running exe, but allows renaming it: every locked vibezen*.exe
 # under target\release is moved aside first, then cargo builds a fresh one.
-# After it finishes, restart VibeStorm (desktop shortcut) to get the new build.
+# After it finishes, restart VibeZen (desktop shortcut) to get the new build.
 
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 $env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 
-Get-ChildItem target\release -Recurse -Filter 'vibestorm*.exe' -ErrorAction SilentlyContinue | ForEach-Object {
+Get-ChildItem target\release -Recurse -Filter 'vibezen*.exe' -ErrorAction SilentlyContinue | ForEach-Object {
     $f = $_.FullName
     if ($_.Name -like '*.old-*') {
         # leftovers from earlier builds: delete the ones no longer running
@@ -27,4 +27,4 @@ Get-ChildItem target\release -Recurse -Filter 'vibestorm*.exe' -ErrorAction Sile
 cargo build --release
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 Write-Host ""
-Write-Host "Built target\release\vibestorm.exe - restart VibeStorm to use it."
+Write-Host "Built target\release\vibezen.exe - restart VibeZen to use it."

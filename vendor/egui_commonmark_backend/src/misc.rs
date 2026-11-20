@@ -236,7 +236,7 @@ impl Style {
         }
 
         if self.code {
-            // VibeStorm patch: inline code gets its own colour (set by the app through
+            // VibeZen patch: inline code gets its own colour (set by the app through
             // `set_inline_code_style`) and sits on the body text's baseline; `text_label`
             // puts it on a chip.
             text = match inline_code_style(ui) {
@@ -257,7 +257,7 @@ impl Style {
     }
 }
 
-const INLINE_CODE_STYLE_ID: &str = "vibestorm_inline_code_style";
+const INLINE_CODE_STYLE_ID: &str = "vibezen_inline_code_style";
 
 #[derive(Clone, Copy)]
 struct InlineCodeStyle {
@@ -269,7 +269,7 @@ fn inline_code_style(ui: &Ui) -> Option<InlineCodeStyle> {
     ui.data(|d| d.get_temp::<InlineCodeStyle>(Id::new(INLINE_CODE_STYLE_ID)))
 }
 
-/// VibeStorm patch: text and chip colours for inline `code` spans
+/// VibeZen patch: text and chip colours for inline `code` spans
 /// (instead of egui's `code_bg_color` behind the regular text colour).
 pub fn set_inline_code_style(ctx: &egui::Context, fg: egui::Color32, bg: egui::Color32) {
     let style = InlineCodeStyle { fg, bg };
@@ -322,7 +322,7 @@ impl TextMetrics {
     }
 }
 
-/// VibeStorm patch: a run of paragraph text. Inline code (with an app style) sits on a
+/// VibeZen patch: a run of paragraph text. Inline code (with an app style) sits on a
 /// rounded chip that hugs its glyphs: egui's own text background spans the font's line
 /// box, which for a font with a line gap (Consolas) leaves far more room above the
 /// letters than below. A span that doesn't fit the rest of the row starts a new row

@@ -1,4 +1,4 @@
-# ⚡ VibeStorm
+# 🪷 VibeZen
 
 A lightweight native IDE for Windows, written in Rust (egui + OpenGL). It has a PhpStorm-style layout, git, and one **Claude Code agent per project, all running in parallel**.
 
@@ -8,11 +8,11 @@ A lightweight native IDE for Windows, written in Rust (egui + OpenGL). It has a 
 ## Run / build
 
 ```
-target\release\vibestorm.exe [project-folder]
+target\release\vibezen.exe [project-folder]
 cargo build --release
 ```
 
-Settings are stored in `%APPDATA%\VibeStorm\settings.json`. Open projects, their tabs and each project's last Claude session are restored on start.
+Settings are stored in `%APPDATA%\VibeZen\settings.json`. Open projects, their tabs and each project's last Claude session are restored on start.
 
 ## Layout
 
@@ -31,7 +31,7 @@ Each project runs its own `claude` process (stream-json protocol, the same one t
 - **Approvals:** Allow / Always allow / Deny cards, with a diff preview for edits. There are also cards for Claude's questions and for plan approval.
 - **Modes:** Ask, Accept edits, Auto, Plan, Bypass. **Models:** Default, Fable, Opus, Sonnet, Haiku.
 - **Images:** 📎 attach, **Ctrl+V** paste a screenshot, or drag an image file onto the window.
-- **Notifications:** when a task finishes or needs you, in any project: a Windows toast from "VibeStorm" (click it to jump to the project), a card in the bottom-right of the IDE, and a taskbar flash. You can change this in ⚙ Settings.
+- **Notifications:** when a task finishes or needs you, in any project: a Windows toast from "VibeZen" (click it to jump to the project), a card in the bottom-right of the IDE, and a taskbar flash. You can change this in ⚙ Settings.
 - Files Claude edits reload in open tabs automatically, and git status refreshes.
 - Commit message ✨ Generate uses a one-shot Claude Haiku call on the selected diff.
 - `claude` processes run in a Windows Job Object, so they die with the IDE even if it crashes.

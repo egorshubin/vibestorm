@@ -892,7 +892,7 @@ impl CommonMarkViewerInternal {
             let mut events_iter = item_events.into_iter().enumerate().peekable();
 
             // Required to ensure that the content of the list item is aligned with
-            // the * or - when wrapping. VibeStorm: same layout and row height as the
+            // the * or - when wrapping. VibeZen: same layout and row height as the
             // viewer's own, so the item's first line shares the marker's baseline.
             let layout = egui::Layout::left_to_right(egui::Align::BOTTOM).with_main_wrap(true);
             ui.with_layout(layout, |ui| {
@@ -1261,7 +1261,7 @@ impl CommonMarkViewerInternal {
         options: &CommonMarkOptions,
     ) {
         let rich_text = self.text_style.to_richtext(ui, &text);
-        egui_commonmark_backend::text_label(ui, rich_text, self.text_style.code); // VibeStorm patch
+        egui_commonmark_backend::text_label(ui, rich_text, self.text_style.code); // VibeZen patch
     }
 
     #[cfg(feature = "regex")]
@@ -1279,7 +1279,7 @@ impl CommonMarkViewerInternal {
         let search_cache = &mut vc.search_cache;
         let ranges = search_cache.search_ranges();
         if ranges.is_empty() {
-            egui_commonmark_backend::text_label(ui, rich_text, self.text_style.code); // VibeStorm patch
+            egui_commonmark_backend::text_label(ui, rich_text, self.text_style.code); // VibeZen patch
             return;
         }
 

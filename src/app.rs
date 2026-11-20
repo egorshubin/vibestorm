@@ -387,8 +387,8 @@ impl IdeApp {
             hl,
             projects: vec![],
             active: 0,
-            // VIBESTORM_VIEW=git / log / find opens that tool window on start
-            left: Some(match std::env::var("VIBESTORM_VIEW").as_deref() {
+            // VIBEZEN_VIEW=git / log / find opens that tool window on start
+            left: Some(match std::env::var("VIBEZEN_VIEW").as_deref() {
                 Ok("git") => LeftTab::Commit,
                 Ok("log") => LeftTab::Log,
                 Ok("find") => LeftTab::Find,
@@ -539,7 +539,7 @@ impl IdeApp {
 
     fn open_virtual(&mut self, title: String, key: String, text: String) {
         let Some(p) = self.proj() else { return };
-        if let Some(i) = p.docs.iter().position(|d| d.path == PathBuf::from(format!("vibestorm://{key}"))) {
+        if let Some(i) = p.docs.iter().position(|d| d.path == PathBuf::from(format!("vibezen://{key}"))) {
             p.docs[i] = Doc::virtual_doc(&title, &key, text);
             p.active_doc = Some(i);
         } else {
@@ -619,7 +619,7 @@ impl IdeApp {
         if self.settings.notify_only_unfocused && visible {
             return;
         }
-        // Windows toast; clicking it brings VibeStorm to the front on that project
+        // Windows toast; clicking it brings VibeZen to the front on that project
         let tx = self.toast_click_tx.clone();
         let c = ctx.clone();
         util::notify(
@@ -1086,7 +1086,7 @@ impl IdeApp {
         ui.horizontal_centered(|ui| {
             ui.spacing_mut().item_spacing.x = 14.0;
             let Some(p) = self.projects.get_mut(self.active) else {
-                ui.label(RichText::new("VibeStorm").small().color(pal.text_weak));
+                ui.label(RichText::new("VibeZen").small().color(pal.text_weak));
                 return;
             };
             if !p.git.busy.is_empty() {
@@ -1695,7 +1695,16 @@ impl IdeApp {
     fn welcome(&mut self, ui: &mut Ui, pal: &Palette, acts: &mut Vec<Action>) {
         ui.vertical_centered(|ui| {
             ui.add_space(ui.available_height() * 0.22);
-            ui.label(RichText::new("⚡ VibeStorm").size(30.0).color(pal.accent).strong());
+            let logo = ui.ctx().data_mut(|d| d.get_temp::<egui::TextureHandle>(egui::Id::new("app-logo"))).unwrap_or_else(|| {
+                let ic = util::app_icon();
+                let ci = egui::ColorImage::from_rgba_unmultiplied([ic.width as usize, ic.height as usize], &ic.rgba);
+                let tex = ui.ctx().load_texture("app-logo", ci, egui::TextureOptions::LINEAR);
+                ui.ctx().data_mut(|d| d.insert_temp(egui::Id::new("app-logo"), tex.clone()));
+                tex
+            });
+            ui.add(egui::Image::new(&logo).fit_to_exact_size(egui::vec2(72.0, 72.0)));
+            ui.add_space(6.0);
+            ui.label(RichText::new("VibeZen").size(30.0).color(pal.accent).strong());
             ui.label(RichText::new("Fast native editor with git and parallel Claude Code agents").color(pal.text_weak));
             ui.add_space(18.0);
             if ui.add(egui::Button::new(RichText::new("  Open Project Folder…  ").color(Color32::WHITE).size(15.0)).fill(pal.accent)).clicked() {
@@ -1773,7 +1782,7 @@ impl IdeApp {
                 Confirm::Exit => {
                     let dirty: usize = self.projects.iter().map(|p| p.dirty_count()).sum();
                     let busy: usize = self.projects.iter().map(|p| p.chats.iter().filter(|c| c.busy).count()).sum();
-                    ("Exit VibeStorm".into(), format!("{}{}", if dirty > 0 { format!("{dirty} unsaved file(s).\n") } else { String::new() }, if busy > 0 { format!("{busy} Claude task(s) still running.") } else { String::new() }), "Save all & exit")
+                    ("Exit VibeZen".into(), format!("{}{}", if dirty > 0 { format!("{dirty} unsaved file(s).\n") } else { String::new() }, if busy > 0 { format!("{busy} Claude task(s) still running.") } else { String::new() }), "Save all & exit")
                 }
             };
             let mut res: Option<u8> = None; // 1 = ok, 2 = alt, 0 = cancel
@@ -1907,7 +1916,7 @@ impl IdeApp {
                         ui.checkbox(&mut self.settings.notify_only_unfocused, "Only when I'm not looking at that project");
                         ui.checkbox(&mut self.settings.notify_sound, "Play sound");
                         if ui.button("Send test notification").clicked() {
-                            util::notify("VibeStorm", "Notifications are working ✔", self.settings.notify_sound, None);
+                            util::notify("VibeZen", "Notifications are working ✔", self.settings.notify_sound, None);
                         }
                     });
                     ui.end_row();
@@ -2416,7 +2425,7 @@ impl eframe::App for IdeApp {
         }
 
         // window title
-        let title = self.projects.get(self.active).map(|p| format!("{} — VibeStorm", p.name)).unwrap_or_else(|| "VibeStorm".into());
+        let title = self.projects.get(self.active).map(|p| format!("{} — VibeZen", p.name)).unwrap_or_else(|| "VibeZen".into());
         if self.title_for.as_ref().map(|t| &t.1) != Some(&title) {
             ctx.send_viewport_cmd(ViewportCommand::Title(title.clone()));
             self.title_for = Some((self.active, title));

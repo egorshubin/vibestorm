@@ -47,7 +47,7 @@ const BUILTIN_COMMANDS: &[(&str, &str)] = &[
 static REPORTED_COMMANDS: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
 
 fn reported_commands_file() -> PathBuf {
-    std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join("VibeStorm").join("slash_commands.json")
+    std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join("VibeZen").join("slash_commands.json")
 }
 
 fn reported_commands() -> Vec<String> {
@@ -862,7 +862,7 @@ impl Chat {
                 } else {
                     let _ = self.write(&json!({
                         "type": "control_response",
-                        "response": {"subtype": "error", "request_id": rid, "error": "Not supported by VibeStorm"}
+                        "response": {"subtype": "error", "request_id": rid, "error": "Not supported by VibeZen"}
                     }));
                 }
             }

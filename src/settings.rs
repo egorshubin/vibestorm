@@ -1,4 +1,4 @@
-//! Persistent settings in %APPDATA%\VibeStorm\settings.json
+//! Persistent settings in %APPDATA%\VibeZen\settings.json
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -61,11 +61,15 @@ impl Settings {
         let base = std::env::var_os("APPDATA")
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
-        base.join("VibeStorm").join("settings.json")
+        base.join("VibeZen").join("settings.json")
     }
 
     pub fn load() -> Self {
-        std::fs::read_to_string(Self::path())
+        let p = Self::path();
+        // first start after the rename: pick up the settings of VibeStorm (saved to the new place)
+        let legacy = p.parent().and_then(|d| d.parent()).map(|b| b.join("VibeStorm").join("settings.json"));
+        std::fs::read_to_string(&p)
+            .or_else(|e| legacy.map_or(Err(e), std::fs::read_to_string))
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default()

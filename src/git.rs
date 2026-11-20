@@ -591,7 +591,7 @@ impl GitState {
                         list.push('\0');
                     }
                 }
-                let file = std::env::temp_dir().join(format!("vibestorm-pathspec-{}-{k}.txt", std::process::id()));
+                let file = std::env::temp_dir().join(format!("vibezen-pathspec-{}-{k}.txt", std::process::id()));
                 let _ = std::fs::write(&file, list);
                 let spec = format!("--pathspec-from-file={}", file.display());
                 steps.push((dir.clone(), vec!["add".into(), "-A".into(), spec.clone(), "--pathspec-file-nul".into()]));
@@ -1521,7 +1521,7 @@ mod multi_repo_tests {
 
     #[test]
     fn nested_repo_changes_are_listed_under_their_repo() {
-        let root = std::env::temp_dir().join(format!("vibestorm-multirepo-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("vibezen-multirepo-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let sub = root.join("libs").join("core");
         std::fs::create_dir_all(&sub).unwrap();
@@ -1541,7 +1541,7 @@ mod multi_repo_tests {
 
     #[test]
     fn unpushed_commits_are_listed() {
-        let base = std::env::temp_dir().join(format!("vibestorm-outgoing-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!("vibezen-outgoing-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let (remote, root) = (base.join("remote.git"), base.join("work"));
         std::fs::create_dir_all(&remote).unwrap();

@@ -347,7 +347,7 @@ fn make_theme(dark: bool) -> Theme {
         })
         .collect();
     Theme {
-        name: Some(if dark { "VibeStorm Dark" } else { "VibeStorm Light" }.into()),
+        name: Some(if dark { "VibeZen Dark" } else { "VibeZen Light" }.into()),
         author: None,
         settings: ThemeSettings {
             foreground: Some(col(if dark { 0xBCBEC4 } else { 0x080808 })),

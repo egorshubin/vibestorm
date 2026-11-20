@@ -1,5 +1,5 @@
 [package]
-name = "vibestorm"
+name = "vibezen"
 version = "0.1.0"
 edition = "2024"
 description = "Lightweight native IDE with git and parallel Claude Code agents"
@@ -26,7 +26,7 @@ zip = { version = "9.8", default-features = false, features = ["deflate-flate2"]
 quick-xml = "0.41"
 
 [patch.crates-io]
-# Inline `code` in Claude's replies: own font, colour and chip (search for "VibeStorm patch")
+# Inline `code` in Claude's replies: own font, colour and chip (search for "VibeZen patch")
 egui_commonmark = { path = "vendor/egui_commonmark" }
 egui_commonmark_backend = { path = "vendor/egui_commonmark_backend" }
 
