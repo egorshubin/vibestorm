@@ -20,7 +20,7 @@ Settings are stored in `%APPDATA%\VibeStorm\settings.json`. Open projects, their
 |---|---|
 | Far-left sidebar | **Projects**. Open projects are at the top in load order, with the folder colour showing the agent: 🟦 idle · 🟨 working (pulses) · 🟩 finished · 🟥 needs you (approval / question) or error. **RECENT** projects (grey folders) are sorted by their last action, newest first. Hover a row to get 🗀 files · ⎇ git · ⏏ unload from memory (stops the agent, moves the project to RECENT). |
 | Left stripe | Project tree (Alt+1), Commit (Alt+0, JetBrains-style change tree), Git log (Alt+9), Find in project (Ctrl+Shift+F: search as you type, Aa / whole word / regex, file mask, ↑↓ + Enter) |
-| Center | Editor tabs. Syntax highlighting (Sublime grammars, incremental), line numbers, find, image preview |
+| Center | Editor tabs. Syntax highlighting (Sublime grammars, incremental), line numbers, find, image preview. Markdown files (`.md`) open rendered, with 👁 Preview / ✎ Source above them (find and go-to-line switch to Source) |
 | Right | Claude Code panel (Alt+2), styled after the VS Code extension. It opens by default for every project; 🕘 lists past conversations |
 | Toolbar | Project menu, branch switcher, Fetch / Pull / Commit / Push, terminal, light/dark theme, settings |
 

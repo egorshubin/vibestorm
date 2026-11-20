@@ -15,6 +15,9 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 const IMAGE_EXT: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "webp", "ico"];
+const MARKDOWN_EXT: &[&str] = &["md", "markdown", "mdx"];
+/// Readable line length for rendered markdown.
+const PREVIEW_MAX_W: f32 = 860.0;
 
 #[derive(PartialEq)]
 pub enum DocKind {
@@ -66,6 +69,10 @@ pub struct Doc {
     pub id: Id,
     pub find: Option<FindState>,
     image: Option<Result<egui::TextureHandle, String>>,
+    /// Markdown files open rendered; `preview` switches between rendered and source.
+    pub markdown: bool,
+    pub preview: bool,
+    md_cache: egui_commonmark::CommonMarkCache,
 }
 
 fn hash_str(s: &str) -> u64 {
@@ -108,6 +115,9 @@ impl Doc {
             id: Id::new(("doc", path.to_path_buf())),
             find: None,
             image: None,
+            markdown: false,
+            preview: false,
+            md_cache: Default::default(),
         };
         let ext = path
             .extension()
@@ -117,6 +127,8 @@ impl Doc {
             doc.kind = DocKind::Image;
             return doc;
         }
+        doc.markdown = MARKDOWN_EXT.contains(&ext.as_str());
+        doc.preview = doc.markdown;
         doc.load_text(hl);
         doc
     }
@@ -146,6 +158,9 @@ impl Doc {
             id: Id::new(("vdoc", key.to_owned())),
             find: None,
             image: None,
+            markdown: false,
+            preview: false,
+            md_cache: Default::default(),
         }
     }
 
@@ -283,6 +298,8 @@ impl Doc {
     }
 
     pub fn open_find(&mut self) {
+        // find works on the source text
+        self.preview = false;
         match &mut self.find {
             Some(f) => f.focus = true,
             None => {
@@ -313,8 +330,65 @@ pub fn show_doc(ui: &mut Ui, doc: &mut Doc, cx: &EditorCtx) {
             let msg = msg.clone();
             ui.centered_and_justified(|ui| ui.label(RichText::new(msg).color(cx.pal.text_weak)));
         }
+        DocKind::Text if doc.markdown => {
+            // jumping to a line (search result, go to line) needs the source view
+            if doc.goto.is_some() {
+                doc.preview = false;
+            }
+            markdown_bar(ui, doc, cx);
+            if doc.preview {
+                show_markdown(ui, doc, cx);
+            } else {
+                show_text(ui, doc, cx);
+            }
+        }
         DocKind::Text | DocKind::Diff => show_text(ui, doc, cx),
     }
+}
+
+/// Preview / Source switch above a markdown document.
+fn markdown_bar(ui: &mut Ui, doc: &mut Doc, cx: &EditorCtx) {
+    Frame::NONE
+        .fill(cx.pal.panel_bg)
+        .inner_margin(egui::Margin::symmetric(8, 3))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                if ui.selectable_label(doc.preview, "👁 Preview").clicked() && !doc.preview {
+                    doc.preview = true;
+                    doc.find = None;
+                }
+                if ui.selectable_label(!doc.preview, "✎ Source").clicked() && doc.preview {
+                    doc.preview = false;
+                }
+            });
+        });
+}
+
+fn show_markdown(ui: &mut Ui, doc: &mut Doc, cx: &EditorCtx) {
+    let avail = ui.available_rect_before_wrap();
+    ui.painter().rect_filled(avail, 0.0, cx.pal.editor_bg);
+    egui::ScrollArea::vertical()
+        .id_salt(doc.id.with("preview"))
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            let w = ui.available_width();
+            let col = (w - 48.0).min(PREVIEW_MAX_W).max(200.0);
+            ui.add_space(16.0);
+            ui.horizontal(|ui| {
+                ui.add_space(((w - col) / 2.0).max(0.0));
+                ui.vertical(|ui| {
+                    ui.set_width(col);
+                    // the UI theme's Heading is only body + 3; documents want a real h1…h6 scale
+                    let style = ui.style_mut();
+                    let body = style.text_styles.get(&egui::TextStyle::Body).map_or(14.0, |f| f.size);
+                    style.text_styles.insert(egui::TextStyle::Heading, FontId::proportional(body * 2.0));
+                    style.override_text_valign = Some(Align::BOTTOM);
+                    egui_commonmark::CommonMarkViewer::new().show(ui, &mut doc.md_cache, &doc.text);
+                });
+            });
+            ui.add_space(32.0);
+        });
 }
 
 fn show_image(ui: &mut Ui, doc: &mut Doc, cx: &EditorCtx) {
