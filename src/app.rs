@@ -709,6 +709,12 @@ impl IdeApp {
         if sc(cs, Key::N) {
             self.quick = Some(QuickOpen { query: String::new(), results: vec![], computed: None, sel: 0, focus: true });
         }
+        if sc(Modifiers::ALT, Key::Insert) {
+            if let Some(p) = self.proj() {
+                let dir = p.tree.new_target_dir();
+                self.prompt = Some(Prompt { kind: PromptKind::NewFile(dir), value: String::new(), focus: true });
+            }
+        }
         if sc(cs, Key::F) {
             self.left = Some(LeftTab::Find);
             if let Some(p) = self.projects.get_mut(self.active) {
@@ -1724,12 +1730,17 @@ impl IdeApp {
     fn modals(&mut self, ctx: &egui::Context, pal: &Palette) {
         // ---- prompt
         if let Some(pr) = &mut self.prompt {
+            // where a new file / folder lands, relative to the project
+            let into = |dir: &Path| {
+                let rel = self.projects.get(self.active).map(|p| util::rel_path(&p.root, dir)).unwrap_or_default();
+                if rel.is_empty() { String::new() } else { format!(" in {rel}/") }
+            };
             let title = match &pr.kind {
-                PromptKind::NewFile(_) => "New File",
-                PromptKind::NewFolder(_) => "New Folder",
-                PromptKind::Rename(_) => "Rename",
-                PromptKind::GotoLine => "Go to Line[:Column]",
-                PromptKind::NewBranch => "New Branch",
+                PromptKind::NewFile(d) => format!("New File{}", into(d)),
+                PromptKind::NewFolder(d) => format!("New Folder{}", into(d)),
+                PromptKind::Rename(_) => "Rename".into(),
+                PromptKind::GotoLine => "Go to Line[:Column]".into(),
+                PromptKind::NewBranch => "New Branch".into(),
             };
             let mut done = None;
             let resp = egui::Modal::new(Id::new("prompt")).show(ctx, |ui| {

@@ -62,6 +62,15 @@ impl FileTree {
         self.selected = Some(path.to_path_buf());
     }
 
+    /// Where "new file" goes: the selected folder, the folder of the selected file, or the root.
+    pub fn new_target_dir(&self) -> PathBuf {
+        match &self.selected {
+            Some(p) if p.is_dir() => p.clone(),
+            Some(p) => p.parent().filter(|d| d.starts_with(&self.root)).unwrap_or(&self.root).to_path_buf(),
+            None => self.root.clone(),
+        }
+    }
+
     fn children(&mut self, dir: &Path) -> &Vec<Entry> {
         if !self.cache.contains_key(dir) {
             let mut v: Vec<Entry> = std::fs::read_dir(dir)
@@ -128,13 +137,43 @@ impl FileTree {
         let small = FontId::proportional(9.5);
         let root = self.root.clone();
 
-        // root row
-        ui.horizontal(|ui| {
+        // root row: name, path and the new file / folder buttons
+        let target = self.new_target_dir();
+        let resp = ui.horizontal(|ui| {
             ui.add_space(4.0);
             ui.label(egui::RichText::new(
                 root.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
             ).strong());
-            ui.add(egui::Label::new(egui::RichText::new(root.display().to_string()).small().color(pal.text_weak)).truncate());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let into = crate::util::rel_path(&root, &target);
+                let into = if into.is_empty() { "the project root".to_owned() } else { format!("{into}/") };
+                if ui.small_button("📁").on_hover_text(format!("New folder in {into}")).clicked() {
+                    action = Some(TreeAction::NewFolder(target.clone()));
+                }
+                if ui.small_button("📄").on_hover_text(format!("New file in {into}  (Alt+Insert)")).clicked() {
+                    action = Some(TreeAction::NewFile(target.clone()));
+                }
+                ui.add(egui::Label::new(egui::RichText::new(root.display().to_string()).small().color(pal.text_weak)).truncate());
+            });
+        }).response.interact(Sense::click());
+        resp.context_menu(|ui| {
+            if ui.button("📄  New File…").clicked() {
+                action = Some(TreeAction::NewFile(root.clone()));
+                ui.close();
+            }
+            if ui.button("📁  New Folder…").clicked() {
+                action = Some(TreeAction::NewFolder(root.clone()));
+                ui.close();
+            }
+            ui.separator();
+            if ui.button("Reveal in Explorer").clicked() {
+                action = Some(TreeAction::Reveal(root.clone()));
+                ui.close();
+            }
+            if ui.button("Open Terminal Here").clicked() {
+                action = Some(TreeAction::Terminal(root.clone()));
+                ui.close();
+            }
         });
 
         egui::ScrollArea::vertical()
