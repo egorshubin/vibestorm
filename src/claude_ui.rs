@@ -65,6 +65,18 @@ fn chip(ui: &mut Ui, pal: &Palette, text: &str, tip: &str) -> egui::Response {
     resp.on_hover_text(tip)
 }
 
+/// An attached document: icon and name in a rounded frame.
+fn file_chip(ui: &mut Ui, pal: &Palette, name: &str, removable: bool) -> egui::Response {
+    let font = FontId::proportional(12.0);
+    let g = ui.painter().layout_no_wrap(format!("📄 {}", crate::util::truncate(name, 40)), font, pal.text);
+    let size = vec2(g.size().x + 16.0, if removable { 48.0 } else { 24.0 });
+    let (rect, resp) = ui.allocate_exact_size(size, if removable { Sense::click() } else { Sense::hover() });
+    let fill = if removable && resp.hovered() { pal.hover } else { pal.button_bg };
+    ui.painter().rect(rect, 6.0, fill, Stroke::new(1.0, pal.border), egui::StrokeKind::Inside);
+    ui.painter().galley(rect.center() - g.size() / 2.0, g, pal.text);
+    resp
+}
+
 /// Commands matching what is typed after the `/`: name prefix first, then anywhere in the name.
 fn command_matches(cmds: &[claude::SlashCommand], q: &str) -> Vec<(String, String)> {
     let q = q.to_lowercase();
@@ -438,7 +450,10 @@ pub fn show(
                         let mut remove = None;
                         ui.horizontal_wrapped(|ui| {
                             for (i, a) in chat.attachments.iter().enumerate() {
-                                let r = ui.add(egui::Image::from_texture((a.thumb.id(), vec2(48.0, 48.0))).corner_radius(6).sense(Sense::click()));
+                                let r = match &a.thumb {
+                                    Some(t) => ui.add(egui::Image::from_texture((t.id(), vec2(48.0, 48.0))).corner_radius(6).sense(Sense::click())),
+                                    None => file_chip(ui, pal, &a.name, true),
+                                };
                                 if r.on_hover_text(format!("{}  ·  click to remove", a.name)).clicked() {
                                     remove = Some(i);
                                 }
@@ -502,15 +517,18 @@ pub fn show(
                                 chat.focus_input = true;
                             }
                         }
-                        if chip(ui, pal, "📎", "Attach images (or paste with Ctrl+V)").clicked() {
+                        if chip(ui, pal, "📎", "Attach images, PDF, Word, Excel or text files (or paste images with Ctrl+V)").clicked() {
                             crate::util::tall_file_dialog();
+                            let all: Vec<&str> = crate::attach::IMAGE_EXTS.iter().chain(crate::attach::DOC_EXTS).copied().collect();
                             if let Some(files) = rfd::FileDialog::new()
-                                .add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp", "bmp"])
+                                .add_filter("Images and documents", &all)
+                                .add_filter("Images", crate::attach::IMAGE_EXTS)
+                                .add_filter("Documents", crate::attach::DOC_EXTS)
+                                .add_filter("All files", &["*"])
                                 .pick_files()
                             {
                                 for f in files {
-                                    let name = f.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                                    match std::fs::read(&f).map_err(|e| e.to_string()).and_then(|b| claude::prepare_image(ui.ctx(), &name, b)) {
+                                    match crate::attach::load(ui.ctx(), &f) {
                                         Ok(a) => chat.attachments.push(a),
                                         Err(e) => chat.items.push(Item::Error(e)),
                                     }
@@ -633,7 +651,7 @@ pub fn show(
                     }
                     for (idx, item) in items.iter_mut().enumerate() {
                         match item {
-                            Item::User { text, thumbs } => {
+                            Item::User { text, thumbs, files } => {
                                 ui.add_space(8.0);
                                 Frame::NONE
                                     .fill(pal.user_bubble)
@@ -646,6 +664,13 @@ pub fn show(
                                             ui.horizontal_wrapped(|ui| {
                                                 for t in thumbs.iter() {
                                                     ui.add(egui::Image::from_texture((t.id(), vec2(72.0, 72.0))).corner_radius(4));
+                                                }
+                                            });
+                                        }
+                                        if !files.is_empty() {
+                                            ui.horizontal_wrapped(|ui| {
+                                                for f in files.iter() {
+                                                    file_chip(ui, pal, f, false);
                                                 }
                                             });
                                         }

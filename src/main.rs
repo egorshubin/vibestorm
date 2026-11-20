@@ -4,6 +4,7 @@
 //! parallel Claude Code agents, one per open project.
 
 mod app;
+mod attach;
 mod claude;
 mod claude_ui;
 mod editor;

@@ -2439,13 +2439,10 @@ impl eframe::App for IdeApp {
                 self.add_project(path, &ctx, true);
                 continue;
             }
-            let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-            let is_img = ["png", "jpg", "jpeg", "gif", "webp", "bmp"].contains(&ext.as_str());
             let claude_tab = self.projects.get(self.active).is_some_and(|p| p.active_doc.is_none());
-            if is_img && claude_tab {
-                let name = path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            if claude_tab && crate::attach::is_attachable(&path) {
                 if let Some(p) = self.projects.get_mut(self.active) {
-                    match std::fs::read(&path).map_err(|e| e.to_string()).and_then(|b| crate::claude::prepare_image(&ctx, &name, b)) {
+                    match crate::attach::load(&ctx, &path) {
                         Ok(a) => p.chat_mut().attachments.push(a),
                         Err(e) => self.message = Some((e, true)),
                     }

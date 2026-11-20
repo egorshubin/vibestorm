@@ -155,11 +155,13 @@ impl Drop for Session {
     }
 }
 
-pub struct ChatImage {
+/// A file attached to the next message (see `attach.rs`).
+pub struct Attachment {
     pub name: String,
-    pub media_type: String,
-    pub data_b64: String,
-    pub thumb: egui::TextureHandle,
+    /// content block sent as it is
+    pub block: Value,
+    /// images only; documents show as a named chip
+    pub thumb: Option<egui::TextureHandle>,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -173,6 +175,8 @@ pub enum Item {
     User {
         text: String,
         thumbs: Vec<egui::TextureHandle>,
+        /// names of attached documents
+        files: Vec<String>,
     },
     Assistant(String),
     Thinking(String),
@@ -246,7 +250,7 @@ pub struct Chat {
     pub cwd: PathBuf,
     pub items: Vec<Item>,
     pub input: String,
-    pub attachments: Vec<ChatImage>,
+    pub attachments: Vec<Attachment>,
     session: Option<Session>,
     pub session_id: Option<String>,
     pub resume_id: Option<String>,
@@ -490,15 +494,10 @@ impl Chat {
                 return;
             }
         }
-        let mut content = vec![];
         let atts = std::mem::take(&mut self.attachments);
-        for a in &atts {
-            content.push(json!({
-                "type": "image",
-                "source": {"type": "base64", "media_type": a.media_type, "data": a.data_b64}
-            }));
-        }
-        content.push(json!({"type": "text", "text": if text.is_empty() { "(see attached image)".to_owned() } else { text.clone() }}));
+        let mut content: Vec<Value> = atts.iter().map(|a| a.block.clone()).collect();
+        let fallback = if atts.iter().all(|a| a.thumb.is_some()) { "(see attached image)" } else { "(see attached files)" };
+        content.push(json!({"type": "text", "text": if text.is_empty() { fallback.to_owned() } else { text.clone() }}));
         let msg = json!({
             "type": "user",
             "message": {"role": "user", "content": content},
@@ -507,9 +506,11 @@ impl Chat {
         });
         match self.write(&msg) {
             Ok(()) => {
+                let (images, docs): (Vec<_>, Vec<_>) = atts.into_iter().partition(|a| a.thumb.is_some());
                 self.items.push(Item::User {
                     text,
-                    thumbs: atts.into_iter().map(|a| a.thumb).collect(),
+                    thumbs: images.into_iter().filter_map(|a| a.thumb).collect(),
+                    files: docs.into_iter().map(|a| a.name).collect(),
                 });
                 self.input.clear();
                 self.busy = true;
@@ -917,7 +918,7 @@ impl Chat {
 const MAX_DIM: u32 = 2000;
 const MAX_BYTES: usize = 3_700_000;
 
-pub fn prepare_image(ctx: &egui::Context, name: &str, bytes: Vec<u8>) -> Result<ChatImage, String> {
+pub fn prepare_image(ctx: &egui::Context, name: &str, bytes: Vec<u8>) -> Result<Attachment, String> {
     let fmt = image::guess_format(&bytes).map_err(|e| format!("{name}: not an image ({e})"))?;
     let img = image::load_from_memory_with_format(&bytes, fmt).map_err(|e| format!("{name}: {e}"))?;
     let native = match fmt {
@@ -948,11 +949,13 @@ pub fn prepare_image(ctx: &egui::Context, name: &str, bytes: Vec<u8>) -> Result<
     let thumb = img.thumbnail(160, 160).to_rgba8();
     let ci = egui::ColorImage::from_rgba_unmultiplied([thumb.width() as usize, thumb.height() as usize], thumb.as_raw());
     let tex = ctx.load_texture(format!("att-{name}"), ci, egui::TextureOptions::LINEAR);
-    Ok(ChatImage {
+    Ok(Attachment {
         name: name.to_owned(),
-        media_type,
-        data_b64: base64::engine::general_purpose::STANDARD.encode(data),
-        thumb: tex,
+        block: json!({
+            "type": "image",
+            "source": {"type": "base64", "media_type": media_type, "data": base64::engine::general_purpose::STANDARD.encode(data)}
+        }),
+        thumb: Some(tex),
     })
 }
 
@@ -1150,7 +1153,7 @@ pub fn load_transcript(cwd: &Path, id: &str) -> Vec<Item> {
                 }
                 if !side {
                     if let Some(t) = user_text(&v) {
-                        items.push(Item::User { text: t, thumbs: vec![] });
+                        items.push(Item::User { text: t, thumbs: vec![], files: vec![] });
                     }
                 }
             }
